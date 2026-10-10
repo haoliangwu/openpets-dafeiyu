@@ -8,13 +8,21 @@ A port of `@open-pets/opencode@4.0.0` (written for the OpenCode V1 plugin
 API) to the V2 plugin API, since upstream has not shipped a V2-compatible
 release. Behavior is ported 1:1 from the upstream dist:
 
-- Subscribes to OpenCode events (permission asked, tool execute, session
-  status/idle, user message) and drives pet reactions/speech through the
-  OpenPets desktop app's local IPC (Unix socket, lease-based).
+- Subscribes to the OpenCode event stream and tool hooks, and drives pet
+  reactions/speech through the OpenPets desktop app's local IPC (Unix
+  socket, lease-based).
 - Reaction cooldown 10s, speech 20s, persisted at
   `~/.local/state/openpets/opencode-hook-throttle.json`.
-- Known approximation: V2 has no `chat.message` hook, so "thinking" is
-  triggered from `message.updated` events with `info.role === "user"`.
+- Event mapping (V2 bus events, verified against opencode 2.0.25):
+  `session.inbox.delivered` (user message delivered) → "thinking";
+  `session.execution.succeeded` → "success"; `session.execution.failed` →
+  "error". V2 has no `chat.message` hook and no `message.updated`,
+  `permission.asked`, `session.idle`/`session.status` or `session.error`
+  events, so those V1 paths are not ported.
+- Tool classifier (`tool.execute.before`): edit/write/patch tools →
+  "editing"; bash/shell tools with a test-like command (`test`, `vitest`,
+  `jest`, `pytest`, `npm test`, ...) → "testing"; other bash/shell tools →
+  "running"; all other tools → "working".
 
 Install locally:
 

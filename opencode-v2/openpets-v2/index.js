@@ -17,7 +17,6 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 export const openPetsPluginId = "openpets";
 
 const speechCooldownMs = 20_000;
-const permissionCooldownMs = 3_000;
 const reactionCooldownMs = 10_000;
 
 const allowedReactions = new Set([
@@ -26,11 +25,11 @@ const allowedReactions = new Set([
 ]);
 
 // Speech pools cloned from @open-pets/agent-events@4.0.0 (hookSpeechPools).
+// The V1 "permission" pool is not ported: V2 emits no permission.asked event.
 const hookSpeechPools = {
   thinking: ["Thinking it through", "Let me check", "On it", "Working it out"],
   success: ["Done", "That worked", "All set", "Nice, finished"],
   error: ["Something failed", "Needs another look", "Hit a snag", "Not quite there"],
-  permission: ["Approval needed"],
 };
 
 const SESSION_NONCE = randomUUID();
@@ -40,14 +39,16 @@ function pickHookSpeech(category, random = Math.random) {
   return pool[Math.max(0, Math.min(pool.length - 1, Math.floor(random() * pool.length)))] ?? pool[0] ?? "Working";
 }
 
-// Visible part of validateHookSpeech@4.0.0 (fixed safe pools; the URL
-// rejection rule is approximated).
-function validateHookSpeech(message) {
+// validateHookSpeech@4.0.0: length/single-line/code-like checks plus the
+// V1 URL (http(s) and www.), path-like, and secret-looking assignment rules.
+export function validateHookSpeech(message) {
   if (message.length < 1 || message.length > 140) throw new Error("Hook speech length is invalid.");
   if (/\r|\n/.test(message)) throw new Error("Hook speech must be single line.");
   if (/```|\b(function|const|let|var|class|import|export)\b|[{};]/.test(message))
     throw new Error("Hook speech looks code-like.");
-  if (/https?:\/\/\S+/.test(message)) throw new Error("Hook speech contains a URL.");
+  if (/https?:\/\/\S+|www\.\S+/.test(message)) throw new Error("Hook speech contains a URL.");
+  if (/(^|\s)(?:~|\.{1,2}|[A-Za-z]:)?[\\/][^\s]+/.test(message)) throw new Error("Hook speech contains a path.");
+  if (/\b(api[_-]?key|secret|password|token)\s*[:=]/i.test(message)) throw new Error("Hook speech contains a secret-looking assignment.");
   return message;
 }
 
@@ -95,7 +96,11 @@ function sendRequest(method, params, options) {
     socket.setEncoding("utf8");
     socket.once("connect", () => {
       clearTimeout(connectTimer);
-      socket.write(`${request}\n`);
+      try {
+        socket.write(`${request}\n`);
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
     });
     socket.on("data", (chunk) => {
       buffer += chunk;
@@ -175,75 +180,41 @@ function isTestLikeToolArgs(args) {
   return /\b(test|vitest|jest|pytest|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test)\b/i.test(command);
 }
 
+// V2 bus events are { id, created, type, durable, location, data }; the
+// payload/data wrapper lookups tolerate older shapes defensively.
+function getEventField(event, key) {
+  if (!isRecord(event)) return undefined;
+  if (event[key] !== undefined) return event[key];
+  if (isRecord(event.payload) && event.payload[key] !== undefined) return event.payload[key];
+  if (isRecord(event.data) && event.data[key] !== undefined) return event.data[key];
+  return undefined;
+}
+
 function getEventType(event) {
-  if (!isRecord(event)) return undefined;
-  if (typeof event.type === "string") return event.type;
-  if (isRecord(event.payload) && typeof event.payload.type === "string") return event.payload.type;
-  if (isRecord(event.data) && typeof event.data.type === "string") return event.data.type;
-  return undefined;
+  const type = getEventField(event, "type");
+  return typeof type === "string" ? type : undefined;
 }
 
-function getEventStatusType(event) {
-  const properties = getEventProperties(event);
-  const status = isRecord(properties?.status) ? properties.status : undefined;
-  if (typeof status?.type === "string") return status.type;
-  if (typeof status === "string") return status; // defensive: V2 may emit plain strings
-  return undefined;
-}
-
-function getEventPermission(event) {
-  const properties = getEventProperties(event);
-  if (typeof properties?.permission === "string") return properties.permission;
-  if (Array.isArray(properties?.patterns)) {
-    const hit = properties.patterns.find((pattern) => typeof pattern === "string" && shouldIgnoreOpenPetsTool(pattern));
-    if (typeof hit === "string") return hit;
-  }
-  return undefined;
-}
-
-function getEventProperties(event) {
-  if (!isRecord(event)) return undefined;
-  if (isRecord(event.properties)) return event.properties;
-  if (isRecord(event.payload) && isRecord(event.payload.properties)) return event.payload.properties;
-  if (isRecord(event.data) && isRecord(event.data.properties)) return event.data.properties;
-  return undefined;
-}
-
-// Port of classifyOpenCodeBusEvent@4.0.0, extended with the event types
+// Port of classifyOpenCodeBusEvent@4.0.0, trimmed to the event types
 // OpenCode V2 actually emits (verified against the real /event stream of
-// opencode 2.0.25 — see "VERIFIED V2 EVENTS" below). The V1-era checks are
-// kept first for parity; none of them fire on V2.
-//
-// VERIFIED V2 EVENTS (traced from live traffic, keys: id,created,type,
-// durable,location,data):
-//   session.execution.succeeded  data {sessionID}     — fired once when the
-//     agent run finishes successfully. V2 replacement for V1's
-//     "session.status {type:'idle'}" / "session.idle" terminal signal.
-//   session.execution.failed      data {sessionID}     — run failed. V2
+// opencode 2.0.25):
+//   session.execution.succeeded  data {sessionID} — agent run finished
+//     successfully. V2 replacement for V1's "session.status
+//     {type:'idle'}" / "session.idle" terminal signal.
+//   session.execution.failed      data {sessionID} — run failed. V2
 //     replacement for V1's "session.error".
 //   session.inbox.delivered       data {sessionID, inboxID} — a user message
 //     was delivered to the session. V2 replacement for V1's user-role
 //     "message.updated" / "chat.message" hook.
-// No "session.idle", "session.status", "message.updated", "permission.asked"
-// or "session.error" events exist on the V2 bus.
+// No "session.idle", "session.status", "message.updated",
+// "permission.asked" or "session.error" events exist on the V2 bus, so
+// those V1 branches are not ported.
 export function classifyOpenCodeBusEvent(event) {
   const type = getEventType(event);
-  if (type === "permission.asked")
-    return shouldIgnoreOpenPetsTool(getEventPermission(event) ?? "") ? undefined : { reaction: "waiting", speechCategory: "permission" };
-  if (type === "session.error") return { reaction: "error", speechCategory: "error" };
-  if (type === "session.idle") return { reaction: "success" };
-  if (type === "session.status" && getEventStatusType(event) === "idle") return { reaction: "success" };
-  if (type === "message.updated" && getMessageRole(event) === "user") return { reaction: "thinking" };
   if (type === "session.execution.failed") return { reaction: "error", speechCategory: "error" };
   if (type === "session.execution.succeeded") return { reaction: "success" };
   if (type === "session.inbox.delivered") return { reaction: "thinking" };
   return undefined;
-}
-
-function getMessageRole(event) {
-  const properties = getEventProperties(event);
-  const info = isRecord(properties?.info) ? properties.info : undefined;
-  return typeof info?.role === "string" ? info.role : undefined;
 }
 
 function getDefaultOpenCodeThrottlePath() {
@@ -256,8 +227,7 @@ function getDefaultOpenCodeThrottlePath() {
 
 function shouldSendSpeech(category, options) {
   const now = options.now?.() ?? Date.now();
-  const cooldown = category === "permission" ? permissionCooldownMs : speechCooldownMs;
-  return shouldSendThrottleKey(category, cooldown, now, options.throttlePath ?? getDefaultOpenCodeThrottlePath());
+  return shouldSendThrottleKey(category, speechCooldownMs, now, options.throttlePath ?? getDefaultOpenCodeThrottlePath());
 }
 
 function shouldSendReaction(reaction, options) {
@@ -323,12 +293,20 @@ function sanitizeDebugError(error) {
     .slice(0, 200);
 }
 
+// Single debug logger for the whole plugin. Gated on
+// options.debug === true || OPENPETS_DEBUG === "1", unless options.debugLog
+// overrides it.
+function createDebugLog(options = {}) {
+  if (typeof options.debugLog === "function") return options.debugLog;
+  const debug = options.debug === true || process.env.OPENPETS_DEBUG === "1";
+  return (message) => { if (debug) process.stderr.write(`${message}\n`); };
+}
+
 export function createOpenPetsOpenCodeHooks(options = {}) {
   const pet = options.pet === undefined ? undefined : validateOpenPetsPetArg(options.pet);
   const clientFactory = options.clientFactory ?? (() => createOpenPetsClient({ connectTimeoutMs: 500, responseTimeoutMs: 500 }));
   const schedule = options.schedule ?? defaultSchedule;
-  const debug = options.debug === true || process.env.OPENPETS_DEBUG === "1";
-  const debugLog = options.debugLog ?? ((message) => { if (debug) process.stderr.write(`${message}\n`); });
+  const debugLog = createDebugLog(options);
   const excludedReactions = new Set(sanitizeOpenCodeExcludedReactions(options.excludeReactions));
   let client;
   let lease;
@@ -360,10 +338,10 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
     }
   };
 
-  const getLeaseId = async (hit, requestedPetId) => {
+  const getLeaseId = async (client, requestedPetId) => {
     if (lease && (!lease.expiresAt || lease.expiresAt - Date.now() > 2_000)) return lease.leaseId;
     try {
-      const next = await hit.acquireLease({ requestedPetId });
+      const next = await client.acquireLease({ requestedPetId });
       lease = { leaseId: next.leaseId, expiresAt: next.expiresAt };
       return next.leaseId;
     } catch (error) {
@@ -380,16 +358,10 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
         debugLog(`OpenPets OpenCode event ignored error: ${sanitizeDebugError(error)}`);
       }
     },
-    "chat.message"() {
-      run({ reaction: "thinking" });
-    },
     "tool.execute.before"(input, output) {
       const tool = typeof input.tool === "string" ? input.tool : "";
       if (shouldIgnoreOpenPetsTool(tool)) return;
       run({ reaction: classifyOpenCodeToolReaction(tool, output.args) });
-    },
-    "tool.execute.after"() {
-      // Intentionally quiet for now (V1 parity).
     },
   };
 }
@@ -406,14 +378,7 @@ export default {
   setup(ctx) {
     const options = ctx.options ?? {};
     const hooks = createOpenPetsOpenCodeHooks(options);
-    const setupDebugLog =
-      options.debug === true || process.env.OPENPETS_DEBUG === "1"
-        ? (message) => process.stderr.write(`${message}\n`)
-        : () => {};
-    const setupTrace =
-      options.debug === true || process.env.OPENPETS_DEBUG === "1"
-        ? (message) => process.stderr.write(`${message}\n`)
-        : () => {};
+    const debugLog = createDebugLog(options);
 
     const cleanups = [];
 
@@ -427,12 +392,10 @@ export default {
       void (async () => {
         try {
           for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-            if (typeof event?.type === "string")
-              setupTrace(`OPENPETS_EVENT type=${event.type} keys=${Object.keys(event).join(",")}`);
             hooks.event({ event });
           }
         } catch (error) {
-          setupDebugLog(`OpenPets OpenCode event stream ended: ${sanitizeDebugError(error)}`);
+          debugLog(`OpenPets OpenCode event stream ended: ${sanitizeDebugError(error)}`);
         }
       })();
       cleanups.push(() => controller.abort());
@@ -448,13 +411,10 @@ export default {
         try {
           const input = { tool: typeof event?.tool === "string" ? event.tool : "" };
           const output = { args: event?.input };
-          setupTrace(`OPENPETS_TOOL name=${input.tool}`);
           hooks["tool.execute.before"](input, output);
         } catch (error) {
-          setupDebugLog(`OpenPets OpenCode tool hook ignored error: ${sanitizeDebugError(error)}`);
+          debugLog(`OpenPets OpenCode tool hook ignored error: ${sanitizeDebugError(error)}`);
         }
-      });
-      ctx.tool.hook("execute.after", (event) => {
       });
     }
 
