@@ -1,0 +1,6 @@
+# openpets-dsh bundle layer: one row for the OpenPets bridge plugin.
+# Users can override config (pet, excludeReactions, debug, ...) from their
+# own profile cordis.patch.yml by addressing the row id `openpets`.
+- insert:
+    - id: openpets
+      name: openpets-dsh

@@ -1,0 +1,21 @@
+{
+  "name": "openpets-dsh",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "OpenPets desktop-pet reactions for DSH: drives the OpenPets app's pet from agent lifecycle events.",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4"
+  }
+}

@@ -21,6 +21,9 @@ openpets install --from-zip ./dist/dafeiyu.zip
 - `dist/dafeiyu/pet.json` + `dist/dafeiyu/spritesheet.webp` — installable pet folder
 - `dist/dafeiyu.zip` — zipped package (files at zip root)
 - `previews/` — per-state animation GIFs + contact sheet
+- `opencode-v2/` — OpenCode V2 integration assets (plugin port + agent instructions)
+- `openpets-dsh/` — DSH plugin bundle: drives the pet from DSH agent events
+  (installed in the `desktop` profile)
 
 Built with the [openpet-hatchery](https://github.com/chenmi319/openpet-hatchery) pipeline.
 
