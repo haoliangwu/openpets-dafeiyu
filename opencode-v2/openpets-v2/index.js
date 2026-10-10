@@ -209,10 +209,23 @@ function getEventProperties(event) {
   return undefined;
 }
 
-// Port of classifyOpenCodeBusEvent@4.0.0. V2 keeps the same public event
-// shape ({ type, properties }) on /api/event, so the V1 classifier applies;
-// "session.idle" and user "message.updated" (the V2 replacements for the
-// removed "chat.message" hook) are handled here too.
+// Port of classifyOpenCodeBusEvent@4.0.0, extended with the event types
+// OpenCode V2 actually emits (verified against the real /event stream of
+// opencode 2.0.25 — see "VERIFIED V2 EVENTS" below). The V1-era checks are
+// kept first for parity; none of them fire on V2.
+//
+// VERIFIED V2 EVENTS (traced from live traffic, keys: id,created,type,
+// durable,location,data):
+//   session.execution.succeeded  data {sessionID}     — fired once when the
+//     agent run finishes successfully. V2 replacement for V1's
+//     "session.status {type:'idle'}" / "session.idle" terminal signal.
+//   session.execution.failed      data {sessionID}     — run failed. V2
+//     replacement for V1's "session.error".
+//   session.inbox.delivered       data {sessionID, inboxID} — a user message
+//     was delivered to the session. V2 replacement for V1's user-role
+//     "message.updated" / "chat.message" hook.
+// No "session.idle", "session.status", "message.updated", "permission.asked"
+// or "session.error" events exist on the V2 bus.
 export function classifyOpenCodeBusEvent(event) {
   const type = getEventType(event);
   if (type === "permission.asked")
@@ -221,6 +234,9 @@ export function classifyOpenCodeBusEvent(event) {
   if (type === "session.idle") return { reaction: "success" };
   if (type === "session.status" && getEventStatusType(event) === "idle") return { reaction: "success" };
   if (type === "message.updated" && getMessageRole(event) === "user") return { reaction: "thinking" };
+  if (type === "session.execution.failed") return { reaction: "error", speechCategory: "error" };
+  if (type === "session.execution.succeeded") return { reaction: "success" };
+  if (type === "session.inbox.delivered") return { reaction: "thinking" };
   return undefined;
 }
 
@@ -321,6 +337,7 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
     if (!decision?.reaction) return;
     if (excludedReactions.has(decision.reaction)) return;
     const reaction = decision.reaction;
+    debugLog(`OPENPETS_DECISION reaction=${reaction} speech=${decision.speechCategory ?? ""}`);
     try {
       schedule(async () => {
         try {
@@ -393,27 +410,56 @@ export default {
       options.debug === true || process.env.OPENPETS_DEBUG === "1"
         ? (message) => process.stderr.write(`${message}\n`)
         : () => {};
+    const setupTrace =
+      options.debug === true || process.env.OPENPETS_DEBUG === "1"
+        ? (message) => process.stderr.write(`${message}\n`)
+        : () => {};
+
+    const cleanups = [];
 
     if (typeof ctx.event?.subscribe === "function") {
-      // V1 event(input) -> ctx.event.subscribe(callback). The public event
-      // stream keeps the V1 { type, properties } shape.
-      ctx.event.subscribe((event) => hooks.event({ event }));
+      // V1 event(input) → ctx.event.subscribe() in V2 is an ASYNC ITERATOR
+      // (public server event stream), not a callback register. Events only
+      // arrive when the iterable is consumed; passing a callback silently
+      // dropped every event. Events are { id, created, type, durable,
+      // location, data } — payload lives in `data` (see classifier).
+      const controller = new AbortController();
+      void (async () => {
+        try {
+          for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+            if (typeof event?.type === "string")
+              setupTrace(`OPENPETS_EVENT type=${event.type} keys=${Object.keys(event).join(",")}`);
+            hooks.event({ event });
+          }
+        } catch (error) {
+          setupDebugLog(`OpenPets OpenCode event stream ended: ${sanitizeDebugError(error)}`);
+        }
+      })();
+      cleanups.push(() => controller.abort());
     }
 
     if (typeof ctx.tool?.hook === "function") {
       // V1 "tool.execute.before"(input, output) -> ctx.tool.hook("execute.before", event).
       // V2 event carries { tool, input, ... } (input = args payload).
+      // Registered AFTER the event-stream branch without returning early:
+      // the previous early return left the tool hooks dead, so the pet never
+      // got "editing" from this path (and never any fallback).
       ctx.tool.hook("execute.before", (event) => {
         try {
           const input = { tool: typeof event?.tool === "string" ? event.tool : "" };
           const output = { args: event?.input };
+          setupTrace(`OPENPETS_TOOL name=${input.tool}`);
           hooks["tool.execute.before"](input, output);
         } catch (error) {
           setupDebugLog(`OpenPets OpenCode tool hook ignored error: ${sanitizeDebugError(error)}`);
         }
       });
+      ctx.tool.hook("execute.after", (event) => {
+      });
     }
 
-    return () => {};
+    return () => {
+      for (const cleanup of cleanups) cleanup();
+    };
   },
 };
