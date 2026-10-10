@@ -9,7 +9,7 @@ time while your AI coding agents work.
 - **9 animation states.** Idle, run (left/right), wave, jump, fail, wait,
   task-work, and review — 57 frames on the standard 1536×1872 OpenPets V1
   atlas.
-- **Lightweight.** ~1.2 MB WebP spritesheet (1,216,888 bytes); installs from
+- **Lightweight.** ~1.2 MB WebP spritesheet (1,214,382 bytes); installs from
   a folder or a zip.
 - **Agent-aware.** Ships a [DSH plugin](openpets-dsh/) and an
   [OpenCode V2 plugin](opencode-v2/) that drive her reactions from live
