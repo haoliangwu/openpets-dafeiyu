@@ -1,0 +1,8 @@
+{
+  "name": "openpets-v2",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "Local OpenCode V2 port of @open-pets/opencode (drives OpenPets pet reactions from OpenCode events)."
+}
