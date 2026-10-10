@@ -1,4 +1,4 @@
-# 大肥鱼 (dafeyu)
+# 大肥鱼 (dafeiyu)
 
 A fan-made OpenPets desktop pet: a chibi whale-girl maid inspired by the
 DeepSeek mascot "小鲸 / DeepSeek酱" — navy hair with hook-shaped ahoge,
@@ -10,16 +10,16 @@ Idle, run (left/right), wave, jump, fail, wait, task-work and review —
 ## Install
 
 ```bash
-npx -y install-pet dafeyu
+npx -y install-pet dafeiyu
 # or, from a local clone / downloaded zip:
-openpets install --from-folder ./dist/dafeyu
-openpets install --from-zip ./dist/dafeyu.zip
+openpets install --from-folder ./dist/dafeiyu
+openpets install --from-zip ./dist/dafeiyu.zip
 ```
 
 ## Package
 
-- `dist/dafeyu/pet.json` + `dist/dafeyu/spritesheet.webp` — installable pet folder
-- `dist/dafeyu.zip` — zipped package (files at zip root)
+- `dist/dafeiyu/pet.json` + `dist/dafeiyu/spritesheet.webp` — installable pet folder
+- `dist/dafeiyu.zip` — zipped package (files at zip root)
 - `previews/` — per-state animation GIFs + contact sheet
 
 Built with the [openpet-hatchery](https://github.com/chenmi319/openpet-hatchery) pipeline.
