@@ -166,8 +166,8 @@ export function shouldIgnoreOpenPetsTool(toolName) {
 export function classifyOpenCodeToolReaction(toolName, args) {
   const normalized = toolName.toLowerCase();
   if (/edit|write|patch|apply_patch/.test(normalized)) return "editing";
-  if (/bash|shell|terminal/.test(normalized)) return isTestLikeToolArgs(args) ? "testing" : undefined;
-  return undefined;
+  if (/bash|shell|terminal/.test(normalized)) return isTestLikeToolArgs(args) ? "testing" : "running";
+  return "working";
 }
 
 function isTestLikeToolArgs(args) {
