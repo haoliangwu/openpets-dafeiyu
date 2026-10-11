@@ -68,8 +68,8 @@ const defaultConnectTimeoutMs = 500;
 const defaultResponseTimeoutMs = 500;
 
 export const Config = Schema.object({
-  pet: Schema.string().default('').description(
-    'Optional OpenPets pet id to lease (e.g. "shiba"). Empty = whatever pet the app targets by default.',
+  pet: Schema.string().default('dafeiyu').description(
+    'OpenPets pet id to lease. Default "dafeiyu" (大肥鱼), keeping the DSH pet distinct from the OpenCode host (rainbow-terminal-cat). Empty string falls back to whatever pet the app targets by default.',
   ),
   excludeReactions: Schema.array(Schema.union(REACTIONS)).default([]).description(
     'Reactions this profile should never send.',
