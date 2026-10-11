@@ -12,7 +12,7 @@ import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { homedir, tmpdir, userInfo } from "node:os";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 
 export const openPetsPluginId = "openpets";
 
@@ -235,13 +235,62 @@ function shouldSendReaction(reaction, options) {
   return shouldSendThrottleKey(`reaction:${reaction}`, reactionCooldownMs, now, options.throttlePath ?? getDefaultOpenCodeThrottlePath());
 }
 
+// Cross-process lock: multiple hosts (TUI + desktop, or host + another agent)
+// share the throttle state file. The read-check-write in
+// shouldSendThrottleKey is not atomic across processes: both can read the
+// same stale timestamp, both send, and a later write clobbers the other's
+// timestamp (lost update -> duplicate speech later). O_EXCL lockfile with
+// stale theft; on any lock trouble we proceed unlocked (best effort,
+// throttling must never break hooks).
+const THROTTLE_LOCK_STALE_MS = 1_000;
+const THROTTLE_LOCK_MAX_TRIES = 200; // ~1 s worst case, then unlocked.
+
+function acquireThrottleLock(path) {
+  const lockPath = `${path}.lock`;
+  try {
+    mkdirSync(dirname(lockPath), { recursive: true });
+  } catch {}
+  for (let attempt = 0; attempt < THROTTLE_LOCK_MAX_TRIES; attempt++) {
+    try {
+      return { fd: openSync(lockPath, "wx"), lockPath };
+    } catch (error) {
+      if (error?.code !== "EEXIST") return { fd: undefined, lockPath };
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs < THROTTLE_LOCK_STALE_MS) {
+          const spinUntil = Date.now() + 5;
+          while (Date.now() < spinUntil) {} // bounded busy wait, sync context
+          continue;
+        }
+        unlinkSync(lockPath);
+      } catch {}
+    }
+  }
+  return { fd: undefined, lockPath };
+}
+
+function releaseThrottleLock(acquired) {
+  if (acquired.fd !== undefined) {
+    try {
+      closeSync(acquired.fd);
+    } catch {}
+  }
+  try {
+    unlinkSync(acquired.lockPath);
+  } catch {}
+}
+
 function shouldSendThrottleKey(key, cooldown, now, path) {
-  const state = readThrottleState(path);
-  const previous = typeof state[key] === "number" ? state[key] : 0;
-  if (now - previous < cooldown) return false;
-  state[key] = now;
-  writeThrottleState(path, state);
-  return true;
+  const acquired = acquireThrottleLock(path);
+  try {
+    const state = readThrottleState(path);
+    const previous = typeof state[key] === "number" ? state[key] : 0;
+    if (now - previous < cooldown) return false;
+    state[key] = now;
+    writeThrottleState(path, state);
+    return true;
+  } finally {
+    releaseThrottleLock(acquired);
+  }
 }
 
 function readThrottleState(path) {

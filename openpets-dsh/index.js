@@ -261,43 +261,46 @@ function shouldSendSpeech(category) {
 // read the same stale timestamp, both send, and a later write clobbers the
 // other's timestamp). O_EXCL lockfile with stale theft; on lock trouble
 // proceed unlocked (best effort, throttling must never break hooks).
-function tryAcquireThrottleLock(path, timeoutMs = 2_000) {
+const THROTTLE_LOCK_STALE_MS = 1_000;
+const THROTTLE_LOCK_MAX_TRIES = 200; // ~1 s worst case, then unlocked.
+
+function acquireThrottleLock(path) {
   const lockPath = `${path}.lock`;
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
+  try {
+    mkdirSync(dirname(lockPath), { recursive: true });
+  } catch {}
+  for (let attempt = 0; attempt < THROTTLE_LOCK_MAX_TRIES; attempt++) {
     try {
-      return openSync(lockPath, 'wx');
+      return { fd: openSync(lockPath, 'wx'), lockPath };
     } catch (error) {
-      if (error?.code !== 'EEXIST') return undefined;
+      if (error?.code !== 'EEXIST') return { fd: undefined, lockPath };
       try {
-        if (Date.now() - statSync(lockPath).mtimeMs > timeoutMs) {
-          unlinkSync(lockPath);
+        if (Date.now() - statSync(lockPath).mtimeMs < THROTTLE_LOCK_STALE_MS) {
+          const spinUntil = Date.now() + 5;
+          while (Date.now() < spinUntil) {} // bounded busy wait, sync context
           continue;
         }
-      } catch {
-        continue;
-      }
-      if (Date.now() >= deadline) return undefined;
-      const spinUntil = Date.now() + 5;
-      while (Date.now() < spinUntil) {} // bounded busy wait, sync context
+        unlinkSync(lockPath);
+      } catch {}
     }
   }
+  return { fd: undefined, lockPath };
 }
 
-function releaseThrottleLock(path, lock) {
-  if (lock !== undefined) {
+function releaseThrottleLock(acquired) {
+  if (acquired.fd !== undefined) {
     try {
-      closeSync(lock);
+      closeSync(acquired.fd);
     } catch {}
   }
   try {
-    unlinkSync(`${path}.lock`);
+    unlinkSync(acquired.lockPath);
   } catch {}
 }
 
 function shouldSendThrottleKey(key, cooldown) {
   const path = getDefaultThrottlePath();
-  const lock = tryAcquireThrottleLock(path);
+  const acquired = acquireThrottleLock(path);
   try {
     const state = readThrottleState(path);
     const previous = typeof state[key] === 'number' ? state[key] : 0;
@@ -306,19 +309,19 @@ function shouldSendThrottleKey(key, cooldown) {
     writeThrottleState(path, state);
     return true;
   } finally {
-    releaseThrottleLock(path, lock);
+    releaseThrottleLock(acquired);
   }
 }
 
 function markThrottleKey(key) {
   const path = getDefaultThrottlePath();
-  const lock = tryAcquireThrottleLock(path);
+  const acquired = acquireThrottleLock(path);
   try {
     const state = readThrottleState(path);
     state[key] = Date.now();
     writeThrottleState(path, state);
   } finally {
-    releaseThrottleLock(path, lock);
+    releaseThrottleLock(acquired);
   }
 }
 
