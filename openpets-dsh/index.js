@@ -80,6 +80,10 @@ export const Config = Schema.object({
   discoveryPath: Schema.string().default('').description(
     'Override the OpenPets discovery file path. Empty = platform default.',
   ),
+  followSubagents: Schema.boolean().default(true).description(
+    'Follow delegated child sessions: while a subagent runs the pet shows its work. ' +
+      'Set false and only the delegating session drives the pet.',
+  ),
   connectTimeoutMs: Schema.number().step(1).min(50).default(defaultConnectTimeoutMs),
   responseTimeoutMs: Schema.number().step(1).min(50).default(defaultResponseTimeoutMs),
 });
@@ -482,6 +486,11 @@ export function apply(ctx, config) {
   const agents = new Map();
   let driverId;
 
+  // Child SessionIds currently delegating. Needed to recognise a subagent's
+  // own Agent events when `followSubagents` is off.
+  const children = new Set();
+  const followSubagents = config?.followSubagents !== false;
+
   // A Session that dies without an idle event leaves its entry — and the
   // driver seat — behind. After this long without any event it is reclaimed,
   // so the next idle still settles the pet instead of leaving it stuck on a
@@ -525,6 +534,25 @@ export function apply(ctx, config) {
     return best;
   }
 
+  // Any session we have heard from and not seen go idle. The unscoped bucket
+  // is host-level noise, never a place for the pet to settle.
+  function newestKnownAgent(excludeId) {
+    let best;
+    for (const [id, state] of agents) {
+      if (id === excludeId || id === unscopedAgentId) continue;
+      if (!best || state.lastEventAt > best.lastEventAt) best = { id, reaction: state.reaction };
+    }
+    return best;
+  }
+
+  // Where the pet goes when its driver stops: a session still running, else
+  // any session we have heard from without an idle event — a reload mid-turn
+  // leaves the `running` flag unknown, and flashing "success" over that
+  // session's work would be wrong.
+  function handoffTarget(agentId) {
+    return newestRunningAgent(agentId) ?? newestKnownAgent(agentId);
+  }
+
   function logDecision(agentId, reaction, speechCategory) {
     debugLog(`OPENPETS_DECISION agent=${agentId} reaction=${reaction} speech=${speechCategory ?? ''}`);
   }
@@ -537,15 +565,23 @@ export function apply(ctx, config) {
   // payload, so it lands here and must still be able to show "waiting").
   function claimDriver(agentId, reaction, speechCategory) {
     sweepStaleAgents();
+    if (!followSubagents && children.has(agentId)) return;
+    const running = agents.get(agentId)?.running === true || agentId === unscopedAgentId;
+    // A straggler from a session that is not running is ignored outright: it
+    // must neither drive the pet nor leave an entry that a later hand-off
+    // would mistake for a session that is still busy.
+    if (!running && isAnotherAgentRunning(agentId)) return;
     const state = agentState(agentId);
     state.lastEventAt = Date.now();
     state.reaction = reaction;
-    if (!state.running && agentId !== unscopedAgentId && isAnotherAgentRunning(agentId)) return;
     driverId = agentId;
     logDecision(agentId, reaction, speechCategory);
     enqueue({ reaction, speechCategory });
   }
 
+  // A session stops driving: it goes idle, or (for a delegation) its child
+  // settles. The pet then moves to whatever is still busy rather than flashing
+  // "success" over another session's work.
   function releaseDriver(agentId) {
     sweepStaleAgents();
     const state = agentState(agentId);
@@ -557,11 +593,11 @@ export function apply(ctx, config) {
       agents.delete(agentId);
       return;
     }
-    // Hand the pet to a session that is still running, so a finished session
-    // cannot flash "success" over another one's work.
-    const next = newestRunningAgent(agentId);
+    const next = handoffTarget(agentId);
     if (next) {
       driverId = next.id;
+      // The finished session is no longer a candidate for later hand-offs.
+      agents.delete(agentId);
       enqueue({ reaction: next.reaction ?? 'thinking' });
       return;
     }
@@ -636,6 +672,31 @@ export function apply(ctx, config) {
   onWaterfall('user-questions/request', (request) => {
     claimDriver(agentIdOf(request), 'waiting', 'permission');
   });
+
+  // A delegation started: mark the child as running and let it drive the pet.
+  // In-process children are Agents too, so their own events follow; providers
+  // without a local Agent (out-of-process) are covered by this pair alone.
+  // Whether a child may drive at all is decided in one place, by the
+  // `followSubagents` gate inside claimDriver.
+  ctx.on('subagent/start', guarded((info) => {
+    if (typeof info?.id !== 'string') return;
+    children.add(info.id);
+    agentState(info.id).running = true;
+    claimDriver(info.id, 'working');
+  }));
+
+  // A delegation settled: the pet goes back to whatever is still busy.
+  ctx.on('subagent/end', guarded((info) => {
+    if (typeof info?.id !== 'string') return;
+    children.delete(info.id);
+    releaseDriver(info.id);
+  }));
+
+  // A session left the registry (closed, cancelled, or a child disposed
+  // without a lifecycle event): drop its state so it cannot hold the pet.
+  ctx.on('agent/disposed', guarded((payload) => {
+    releaseDriver(agentIdOf(payload));
+  }));
 
   debugLog(
     `OpenPets DSH bridge loaded (pet=${pet ?? 'default'}, reactions excluded: ${[...excludedReactions].join(',') || 'none'})`,

@@ -132,6 +132,80 @@ test('reclaims a session that dies without an idle event', async (t) => {
   assert.deepEqual(fake.reactions(), ['thinking', 'editing', 'success']);
 });
 
+test('a delegation hands the pet back to the delegating session', async (t) => {
+  const { fake, ctx } = await loadPlugin(t);
+
+  // The delegating session never reports `running` here — a reload mid-turn
+  // leaves that flag unknown, and only its activity is on record.
+  await emitPaced(ctx, 'tools/pre-execute', tool('subagent'), () => {});
+  await emitPaced(ctx, 'subagent/start', { id: 'child-1', provider: 'in-process', local: true });
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'child-1' }, status: 'running' });
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'child-1' }, status: 'idle' });
+
+  assert.deepEqual(fake.reactions(), ['working', 'thinking', 'working']);
+});
+
+test('a settled remote delegation hands the pet back', async (t) => {
+  const { fake, ctx } = await loadPlugin(t);
+
+  await emitPaced(ctx, 'tools/pre-execute', tool('subagent'), () => {});
+  await emitPaced(ctx, 'subagent/start', { id: 'child-2', provider: 'remote', local: false });
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'child-2' }, status: 'running' });
+  // A bystander session speaks while the child runs: it must not take the pet,
+  // and it must not become the hand-off target when the delegation ends
+  // (out-of-process providers have no Agent events of their own).
+  await emitPaced(ctx, 'tools/pre-execute', { ...tool('edit'), agent: { id: 'agent-b' } }, () => {});
+  await emitPaced(ctx, 'subagent/end', {
+    id: 'child-2',
+    provider: 'remote',
+    local: false,
+    stopReason: 'completed',
+  });
+
+  assert.deepEqual(fake.reactions(), ['working', 'thinking', 'working']);
+});
+
+test('a remote delegation holds the pet until it settles', async (t) => {
+  const { fake, ctx } = await loadPlugin(t);
+
+  // No Agent events ever arrive for this child (out-of-process provider), so
+  // the lifecycle pair is the only signal that work is in flight.
+  await emitPaced(ctx, 'tools/pre-execute', tool('subagent'), () => {});
+  await emitPaced(ctx, 'subagent/start', { id: 'child-3', provider: 'remote', local: false });
+  await emitPaced(ctx, 'tools/pre-execute', { ...tool('edit'), agent: { id: 'agent-b' } }, () => {});
+  assert.deepEqual(fake.reactions(), ['working'], 'a bystander must not take over a live delegation');
+
+  await emitPaced(ctx, 'subagent/end', { id: 'child-3', provider: 'remote', local: false, stopReason: 'completed' });
+  assert.deepEqual(fake.reactions(), ['working'], 'settling hands the pet back, not to success');
+});
+
+test('subagent sessions can be muted', async (t) => {
+  const { fake, ctx } = await loadPlugin(t, { config: { followSubagents: false } });
+
+  await emitPaced(ctx, 'tools/pre-execute', tool('subagent'), () => {});
+  await emitPaced(ctx, 'subagent/start', { id: 'child-4', provider: 'in-process', local: true });
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'child-4' }, status: 'running' });
+  await emitPaced(ctx, 'tools/pre-execute', { ...tool('edit'), agent: { id: 'child-4' } }, () => {});
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'child-4' }, status: 'idle' });
+  await emitPaced(ctx, 'subagent/end', {
+    id: 'child-4',
+    provider: 'in-process',
+    local: true,
+    stopReason: 'completed',
+  });
+
+  assert.deepEqual(fake.reactions(), ['working'], 'only the delegating session drives the pet');
+});
+
+test('a disposed session releases the pet', async (t) => {
+  const { fake, ctx } = await loadPlugin(t);
+
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'running' });
+  await emitPaced(ctx, 'agent/disposed', { agent: { id: 'agent-a' } });
+
+  assert.deepEqual(fake.reactions(), ['thinking', 'success']);
+});
+
 test('transitions always send, a repeated reaction is damped', async (t) => {
   const { fake, ctx } = await loadPlugin(t);
 

@@ -34,6 +34,9 @@ port in `../opencode-v2/`) to the Cordis plugin API that DSH hosts run.
 | `tools/result` success | thinking (agent resumes generating) | — |
 | `tools/result` with `isError` | error | — |
 | `approval/request`, `user-questions/request` | waiting | "Approval needed" |
+| `subagent/start` (a delegated child run) | working (the child drives until it settles) | — |
+| `subagent/end` | hands the pet back to whatever is still busy | — |
+| `agent/disposed` (session left the registry) | releases the pet | — |
 
 The alternation working (tool running) → thinking (model generating) keeps
 the pet from being pinned in "working" for the whole turn, the flaw the
@@ -64,13 +67,15 @@ Override the `openpets` row from the profile's `cordis.patch.yml`:
     pet: dafeiyu            # lease this pet id (empty = app default)
     excludeReactions: [idle] # reactions to never send
     debug: true              # decision/IPC-error logging (or OPENPETS_DEBUG=1)
+    # followSubagents: true  # false = only the delegating session drives the pet
     # discoveryPath: ''      # override the discovery file path
     # connectTimeoutMs: 500
     # responseTimeoutMs: 500
 ```
 
 Schema defaults: `pet: ''`, `excludeReactions: []`, `debug: false`,
-`discoveryPath: ''`, `connectTimeoutMs: 500`, `responseTimeoutMs: 500`.
+`followSubagents: true`, `discoveryPath: ''`, `connectTimeoutMs: 500`,
+`responseTimeoutMs: 500`.
 
 ## Multiple sessions
 
@@ -93,6 +98,15 @@ plugin instance. The pet is arbitrated rather than last-write-wins:
 - **Serialized sends.** At most one IPC request is in flight, and a decision
   that arrives while another is in flight collapses to the newest one — so a
   slower socket can never deliver a stale reaction after a newer one.
+- **Delegations followed.** A subagent child is an Agent of its own (DSH
+  registers in-process children), so its events drive the pet like any
+  session. The `subagent/start`–`subagent/end` pair additionally covers
+  providers with no local Agent: the delegation still shows as work in
+  progress and hands the pet back when it settles. Set `followSubagents:
+  false` to keep only the delegating session on the pet.
+- **Disposal handled.** A session that leaves the registry without an idle
+  event (closed, cancelled, a child disposed) releases the pet immediately
+  instead of holding it until the 10-minute reclaim.
 
 ## Throttling
 
@@ -112,13 +126,14 @@ The suite starts a fake OpenPets app on a real Unix socket
 (`test/fake-openpets.mjs`) and drives the plugin's actual event handlers
 against it, asserting what the app receives: send order, concurrency
 (`maxInFlight` stays 1), latest-wins collapse, multi-session hand-off,
-straggler and stale-session handling, reaction damping, exclusions, ignored
-OpenPets tools, lease-before-react, and that waterfall handlers forward
-`next()` untouched.
+straggler and stale-session handling, delegation start/settle, muted
+subagents, disposal, reaction damping, exclusions, ignored OpenPets tools,
+lease-before-react, and that waterfall handlers forward `next()` untouched.
 
-Every one of those assertions is mutation-checked: removing the send queue,
-the stale sweep, the not-running guard, or seeding new entries as stale each
-makes specific tests fail.
+Every mechanism is mutation-checked: removing the send queue, the stale
+sweep, the not-running guard, the known-agent fallback, the delegation
+listeners, the disposal listener, the child `running` mark, or the
+`followSubagents` gate each makes specific tests fail.
 
 ## Uninstall / disable
 
