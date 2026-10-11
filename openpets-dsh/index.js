@@ -412,11 +412,11 @@ export function apply(ctx, config) {
   // request is in flight at a time, and a decision that arrives while an
   // older one is still queued replaces it (the pet only needs the newest
   // state, never the stale one that a second socket would deliver late).
-  let queued;
+  let pending;
   let draining = false;
 
   function enqueue(decision) {
-    queued = decision;
+    pending = decision;
     // Start immediately when idle: the first decision of a burst reaches the
     // pet right away, and the rest collapse onto it while it is in flight.
     void drain();
@@ -426,9 +426,9 @@ export function apply(ctx, config) {
     if (draining) return;
     draining = true;
     try {
-      while (queued) {
-        const decision = queued;
-        queued = undefined;
+      while (pending) {
+        const decision = pending;
+        pending = undefined;
         await send(decision);
       }
     } finally {
@@ -452,25 +452,23 @@ export function apply(ctx, config) {
   }
 
   async function send(decision) {
-    if (excludedReactions.has(decision.reaction)) return;
+    const { reaction, speechCategory } = decision;
+    if (excludedReactions.has(reaction)) return;
     try {
-      const shouldSpeak = decision.speechCategory ? shouldSendSpeech(decision.speechCategory) : false;
-      const shouldReact = shouldSendReaction(decision.reaction);
-      if (!shouldSpeak && !shouldReact) return;
+      const speak = speechCategory ? shouldSendSpeech(speechCategory) : false;
+      const react = shouldSendReaction(reaction);
+      if (!speak && !react) return;
       client ??= createOpenPetsClient({
         discoveryPath: config?.discoveryPath || undefined,
         connectTimeoutMs: config?.connectTimeoutMs,
         responseTimeoutMs: config?.responseTimeoutMs,
       });
       const leaseId = pet ? await getLeaseId() : undefined;
-      if (decision.speechCategory && shouldSpeak) {
-        await client.say(validateHookSpeech(pickHookSpeech(decision.speechCategory)), {
-          reaction: decision.reaction,
-          leaseId,
-        });
+      if (speak) {
+        await client.say(validateHookSpeech(pickHookSpeech(speechCategory)), { reaction, leaseId });
         return;
       }
-      await client.react(decision.reaction, { leaseId });
+      await client.react(reaction, { leaseId });
     } catch (error) {
       debugLog(`OpenPets plugin ignored error: ${sanitizeDebugError(error)}`);
     }
@@ -478,52 +476,50 @@ export function apply(ctx, config) {
 
   // ---- Session arbitration ----------------------------------------------
   // One Agent at a time drives the pet: whoever produced the most recent
-  // event. State is per Agent, so concurrent sessions cannot stomp each other
-  // and a finite agent list keeps memory from growing with the host's history.
+  // event. State is per Agent, so concurrent sessions cannot stomp each
+  // other. An entry lives while its Agent runs and is dropped when that Agent
+  // goes idle (an Agent that dies without an idle event keeps its entry).
   const agents = new Map();
   let driverId;
 
   function agentState(agentId) {
     let state = agents.get(agentId);
     if (!state) {
-      state = { running: false, reaction: undefined, at: 0 };
+      state = { running: false, reaction: undefined, lastEventAt: 0 };
       agents.set(agentId, state);
     }
     return state;
   }
 
   function newestRunningAgent(excludeId) {
-    let bestId;
-    let bestAt = -Infinity;
+    let best;
     for (const [id, state] of agents) {
       if (id === excludeId || !state.running) continue;
-      if (state.at > bestAt) {
-        bestAt = state.at;
-        bestId = id;
-      }
+      if (!best || state.lastEventAt > best.lastEventAt) best = { id, reaction: state.reaction };
     }
-    return bestId;
+    return best;
   }
 
-  function reportActive(agentId, reaction, speechCategory) {
+  function logDecision(agentId, reaction, speechCategory) {
+    debugLog(`OPENPETS_DECISION agent=${agentId} reaction=${reaction} speech=${speechCategory ?? ''}`);
+  }
+
+  // This Agent produced the most recent event: it drives the pet, and its
+  // reaction becomes the pet's state.
+  function claimDriver(agentId, reaction, speechCategory) {
     const state = agentState(agentId);
-    state.at = Date.now();
+    state.lastEventAt = Date.now();
     state.reaction = reaction;
     driverId = agentId;
-    debugLog(`OPENPETS_DECISION agent=${agentId} reaction=${reaction} speech=${speechCategory ?? ''}`);
+    logDecision(agentId, reaction, speechCategory);
     enqueue({ reaction, speechCategory });
   }
 
-  function reportRunning(agentId) {
-    agentState(agentId).running = true;
-    reportActive(agentId, 'thinking');
-  }
-
-  function reportIdle(agentId) {
+  function releaseDriver(agentId) {
     const state = agentState(agentId);
     state.running = false;
     state.reaction = undefined;
-    state.at = Date.now();
+    state.lastEventAt = Date.now();
     // Session that was not driving: it must not steal the pet by going idle.
     if (driverId !== undefined && driverId !== agentId) {
       agents.delete(agentId);
@@ -531,15 +527,15 @@ export function apply(ctx, config) {
     }
     // Hand the pet to a session that is still running, so a finished session
     // cannot flash "success" over another one's work.
-    const nextId = newestRunningAgent(agentId);
-    if (nextId !== undefined) {
-      driverId = nextId;
-      enqueue({ reaction: agents.get(nextId)?.reaction ?? 'thinking' });
+    const next = newestRunningAgent(agentId);
+    if (next) {
+      driverId = next.id;
+      enqueue({ reaction: next.reaction ?? 'thinking' });
       return;
     }
     driverId = undefined;
     agents.delete(agentId);
-    debugLog(`OPENPETS_DECISION agent=${agentId} reaction=success speech=success`);
+    logDecision(agentId, 'success', 'success');
     enqueue({ reaction: 'success', speechCategory: 'success' });
   }
 
@@ -565,44 +561,48 @@ export function apply(ctx, config) {
 
   // User message claimed by an agent -> thinking.
   ctx.on('agent/inbox/claimed', guarded((payload) => {
-    reportActive(agentIdOf(payload), 'thinking', 'thinking');
+    claimDriver(agentIdOf(payload), 'thinking', 'thinking');
   }));
 
   // Agent running state; `idle` = the turn settled.
   ctx.on('agent/status', guarded((payload) => {
     const agentId = agentIdOf(payload);
-    if (payload?.status === 'running') reportRunning(agentId);
-    else if (payload?.status === 'idle') reportIdle(agentId);
+    if (payload?.status === 'running') {
+      agentState(agentId).running = true;
+      claimDriver(agentId, 'thinking');
+    } else if (payload?.status === 'idle') {
+      releaseDriver(agentId);
+    }
   }));
 
   // A tool dispatch finished: on failure -> error; otherwise the agent is
   // about to generate again -> thinking.
   ctx.on('tools/result', guarded((exec, result) => {
-    reportActive(agentIdOf(exec), result?.isError ? 'error' : 'thinking');
+    claimDriver(agentIdOf(exec), result?.isError ? 'error' : 'thinking');
   }));
 
   // An LLM attempt started: the model is generating -> thinking.
   ctx.on('agent/assistant-stream', guarded((payload) => {
-    if (payload?.frame?.type === 'start') reportActive(agentIdOf(payload), 'thinking');
+    if (payload?.frame?.type === 'start') claimDriver(agentIdOf(payload), 'thinking');
   }));
 
   // Step or turn errored -> error.
   ctx.on('agent/error', guarded((payload) => {
-    reportActive(agentIdOf(payload), 'error', 'error');
+    claimDriver(agentIdOf(payload), 'error', 'error');
   }));
 
   // Tool dispatch is about to run -> classify the tool for the pet.
   onWaterfall('tools/pre-execute', (exec) => {
     if (shouldIgnoreTool(exec?.name)) return;
-    reportActive(agentIdOf(exec), classifyToolReaction(exec?.name, exec?.arguments));
+    claimDriver(agentIdOf(exec), classifyToolReaction(exec?.name, exec?.arguments));
   });
 
   // Waiting on the human: sandbox approvals and structured questions.
   onWaterfall('approval/request', (request) => {
-    reportActive(agentIdOf(request), 'waiting', 'permission');
+    claimDriver(agentIdOf(request), 'waiting', 'permission');
   });
   onWaterfall('user-questions/request', (request) => {
-    reportActive(agentIdOf(request), 'waiting', 'permission');
+    claimDriver(agentIdOf(request), 'waiting', 'permission');
   });
 
   debugLog(
