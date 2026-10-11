@@ -49,21 +49,30 @@ const tool = (name, command, agentId = 'agent-a') => ({
   agent: { id: agentId },
 });
 
-/** Emit one event and let the queued send finish before the next one. */
-async function emitPaced(ctx, event, ...args) {
+/** Emit one event and wait `ms` so the queued send can finish. */
+async function emitAfter(ctx, ms, event, ...args) {
   ctx.emit(event, ...args);
-  await delay(30);
+  await delay(ms);
 }
 
-test('sends decided reactions in order, one request at a time', async (t) => {
-  const { fake, ctx } = await loadPlugin(t);
+/** Emit one event and let the queued send finish before the next one. */
+async function emitPaced(ctx, event, ...args) {
+  await emitAfter(ctx, 30, event, ...args);
+}
 
-  await emitPaced(ctx, 'tools/pre-execute', tool('bash'), () => {});
-  await emitPaced(ctx, 'agent/inbox/claimed', { agent: { id: 'agent-b' } });
-  await emitPaced(ctx, 'tools/pre-execute', tool('edit'), () => {});
+test('sends paced decisions in order without collapsing them', async (t) => {
+  const { fake, ctx } = await loadPlugin(t, { responseDelayMs: 40 });
+
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'running' });
+  // Slower than the 40 ms response, so each decision is sent on its own
+  // instead of collapsing into the next one.
+  await emitAfter(ctx, 60, 'tools/pre-execute', tool('bash'), () => {});
+  await emitAfter(ctx, 60, 'tools/pre-execute', tool('edit'), () => {});
+  await emitAfter(ctx, 60, 'tools/pre-execute', tool('read'), () => {});
+  await delay(200);
 
   assert.equal(fake.maxInFlight, 1, 'at most one request in flight');
-  assert.deepEqual(fake.reactions(), ['running', 'thinking', 'editing']);
+  assert.deepEqual(fake.reactions(), ['thinking', 'running', 'editing', 'working']);
 });
 
 test('collapses decisions that arrive while a send is in flight', async (t) => {
@@ -94,6 +103,33 @@ test('a non-driving session going idle cannot steal the pet', async (t) => {
 
   await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-b' }, status: 'idle' });
   assert.deepEqual(fake.reactions(), ['thinking', 'editing', 'thinking', 'success']);
+});
+
+test('a session that is not running cannot steal the pet', async (t) => {
+  const { fake, ctx } = await loadPlugin(t);
+
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'running' });
+  await emitPaced(ctx, 'tools/pre-execute', tool('edit'), () => {}); // agent-a drives: editing
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-b' }, status: 'running' });
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-b' }, status: 'idle' }); // back to agent-a
+  // A straggler event from the finished session must not pull the pet back.
+  await emitPaced(ctx, 'tools/result', { ...tool('bash'), agent: { id: 'agent-b' } }, { isError: false });
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'idle' });
+
+  assert.deepEqual(fake.reactions(), ['thinking', 'editing', 'thinking', 'editing', 'success']);
+});
+
+test('reclaims a session that dies without an idle event', async (t) => {
+  const { fake, ctx } = await loadPlugin(t);
+  t.mock.timers.enable({ apis: ['Date'] });
+
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'running' });
+  await emitPaced(ctx, 'tools/pre-execute', tool('edit'), () => {});
+  // agent-a never reports idle: its session is gone.
+  t.mock.timers.tick(11 * 60_000);
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-b' }, status: 'idle' });
+
+  assert.deepEqual(fake.reactions(), ['thinking', 'editing', 'success']);
 });
 
 test('transitions always send, a repeated reaction is damped', async (t) => {

@@ -478,14 +478,39 @@ export function apply(ctx, config) {
   // One Agent at a time drives the pet: whoever produced the most recent
   // event. State is per Agent, so concurrent sessions cannot stomp each
   // other. An entry lives while its Agent runs and is dropped when that Agent
-  // goes idle (an Agent that dies without an idle event keeps its entry).
+  // goes idle.
   const agents = new Map();
   let driverId;
+
+  // A Session that dies without an idle event leaves its entry — and the
+  // driver seat — behind. After this long without any event it is reclaimed,
+  // so the next idle still settles the pet instead of leaving it stuck on a
+  // reaction nobody will ever update.
+  const staleAgentMs = 10 * 60_000;
+
+  function sweepStaleAgents() {
+    if (agents.size === 0) return;
+    const cutoff = Date.now() - staleAgentMs;
+    for (const [id, state] of agents) {
+      if (state.lastEventAt > cutoff) continue;
+      agents.delete(id);
+      if (driverId === id) driverId = undefined;
+    }
+  }
+
+  function isAnotherAgentRunning(agentId) {
+    for (const [id, state] of agents) {
+      if (id !== agentId && state.running) return true;
+    }
+    return false;
+  }
 
   function agentState(agentId) {
     let state = agents.get(agentId);
     if (!state) {
-      state = { running: false, reaction: undefined, lastEventAt: 0 };
+      // A brand-new entry is fresh by definition: it must not be swept as
+      // stale before its first event is even recorded.
+      state = { running: false, reaction: undefined, lastEventAt: Date.now() };
       agents.set(agentId, state);
     }
     return state;
@@ -505,17 +530,24 @@ export function apply(ctx, config) {
   }
 
   // This Agent produced the most recent event: it drives the pet, and its
-  // reaction becomes the pet's state.
+  // reaction becomes the pet's state. A session that is not running must not
+  // pull the pet away from one that is still working — except the unscoped
+  // bucket, which is how host-level and interrupt events arrive
+  // (approval/request carries its Agent on the listener's `this`, not in the
+  // payload, so it lands here and must still be able to show "waiting").
   function claimDriver(agentId, reaction, speechCategory) {
+    sweepStaleAgents();
     const state = agentState(agentId);
     state.lastEventAt = Date.now();
     state.reaction = reaction;
+    if (!state.running && agentId !== unscopedAgentId && isAnotherAgentRunning(agentId)) return;
     driverId = agentId;
     logDecision(agentId, reaction, speechCategory);
     enqueue({ reaction, speechCategory });
   }
 
   function releaseDriver(agentId) {
+    sweepStaleAgents();
     const state = agentState(agentId);
     state.running = false;
     state.reaction = undefined;

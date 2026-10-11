@@ -84,6 +84,12 @@ plugin instance. The pet is arbitrated rather than last-write-wins:
 - **Idle hands off.** When the driver goes idle while another Agent is still
   running, the pet switches to that Agent's state instead of flashing
   "success" over its work. "success" only fires when nothing is running.
+- **No stragglers.** An event from a Session that is not running cannot pull
+  the pet away from one that is still working. Host-level and interrupt
+  events, which arrive without an Agent id, still can.
+- **Stale sessions reclaimed.** A Session that dies without an idle event is
+  reclaimed after 10 minutes of silence — its entry and the driver seat — so
+  the pet cannot get stuck on a reaction nobody will ever update.
 - **Serialized sends.** At most one IPC request is in flight, and a decision
   that arrives while another is in flight collapses to the newest one — so a
   slower socket can never deliver a stale reaction after a newer one.
@@ -106,8 +112,13 @@ The suite starts a fake OpenPets app on a real Unix socket
 (`test/fake-openpets.mjs`) and drives the plugin's actual event handlers
 against it, asserting what the app receives: send order, concurrency
 (`maxInFlight` stays 1), latest-wins collapse, multi-session hand-off,
-reaction damping, exclusions, ignored OpenPets tools, lease-before-react,
-and that waterfall handlers forward `next()` untouched.
+straggler and stale-session handling, reaction damping, exclusions, ignored
+OpenPets tools, lease-before-react, and that waterfall handlers forward
+`next()` untouched.
+
+Every one of those assertions is mutation-checked: removing the send queue,
+the stale sweep, the not-running guard, or seeding new entries as stale each
+makes specific tests fail.
 
 ## Uninstall / disable
 
