@@ -195,27 +195,13 @@ function getEventType(event) {
   return typeof type === "string" ? type : undefined;
 }
 
-// Port of classifyOpenCodeBusEvent@4.0.0, trimmed to the event types
-// OpenCode V2 actually emits (verified against the real /event stream of
-// opencode 2.0.25):
-//   session.execution.succeeded  data {sessionID} — agent run finished
-//     successfully. V2 replacement for V1's "session.status
-//     {type:'idle'}" / "session.idle" terminal signal.
-//   session.execution.failed      data {sessionID} — run failed. V2
-//     replacement for V1's "session.error".
-//   session.inbox.delivered       data {sessionID, inboxID} — a user message
-//     was delivered to the session. V2 replacement for V1's user-role
-//     "message.updated" / "chat.message" hook.
-// No "session.idle", "session.status", "message.updated",
-// "permission.asked" or "session.error" events exist on the V2 bus, so
-// those V1 branches are not ported.
-export function classifyOpenCodeBusEvent(event) {
-  const type = getEventType(event);
-  if (type === "session.execution.failed") return { reaction: "error", speechCategory: "error" };
-  if (type === "session.execution.succeeded") return { reaction: "success" };
-  if (type === "session.inbox.delivered") return { reaction: "thinking" };
-  return undefined;
-}
+// Bus types handled by the arbitration in createOpenPetsOpenCodeHooks:
+//   session.execution.succeeded  data {sessionID} — run finished; releases
+//     the driver (hands the pet to a still-running session, else "success").
+//   session.execution.failed     data {sessionID} — run failed; claims the
+//     driver with "error" + speech.
+//   session.inbox.delivered      data {sessionID, inboxID} — user message;
+//     marks the session running and claims the driver with "thinking".
 
 function getDefaultOpenCodeThrottlePath() {
   if (process.platform === "win32")
@@ -233,6 +219,19 @@ function shouldSendSpeech(category, options) {
 function shouldSendReaction(reaction, options) {
   const now = options.now?.() ?? Date.now();
   return shouldSendThrottleKey(`reaction:${reaction}`, reactionCooldownMs, now, options.throttlePath ?? getDefaultOpenCodeThrottlePath());
+}
+
+function markThrottleKey(key, options) {
+  const now = options.now?.() ?? Date.now();
+  const path = options.throttlePath ?? getDefaultOpenCodeThrottlePath();
+  const acquired = acquireThrottleLock(path);
+  try {
+    const state = readThrottleState(path);
+    state[key] = now;
+    writeThrottleState(path, state);
+  } finally {
+    releaseThrottleLock(acquired);
+  }
 }
 
 // Cross-process lock: multiple hosts (TUI + desktop, or host + another agent)
@@ -354,40 +353,12 @@ function createDebugLog(options = {}) {
 export function createOpenPetsOpenCodeHooks(options = {}) {
   const pet = options.pet === undefined ? undefined : validateOpenPetsPetArg(options.pet);
   const clientFactory = options.clientFactory ?? (() => createOpenPetsClient({ connectTimeoutMs: 500, responseTimeoutMs: 500 }));
-  const schedule = options.schedule ?? defaultSchedule;
   const debugLog = createDebugLog(options);
   const excludedReactions = new Set(sanitizeOpenCodeExcludedReactions(options.excludeReactions));
   let client;
   let lease;
 
-  const run = (decision) => {
-    if (!decision?.reaction) return;
-    if (excludedReactions.has(decision.reaction)) return;
-    const reaction = decision.reaction;
-    debugLog(`OPENPETS_DECISION reaction=${reaction} speech=${decision.speechCategory ?? ""}`);
-    try {
-      schedule(async () => {
-        try {
-          const shouldSpeak = decision.speechCategory ? shouldSendSpeech(decision.speechCategory, options) : false;
-          const shouldReact = shouldSendReaction(reaction, options);
-          if (!shouldSpeak && !shouldReact) return;
-          client ??= clientFactory();
-          const leaseId = pet ? await getLeaseId(client, pet) : undefined;
-          if (decision.speechCategory && shouldSpeak) {
-            await client.say(validateHookSpeech(pickHookSpeech(decision.speechCategory, options.random)), { reaction, leaseId });
-            return;
-          }
-          await client.react(reaction, { leaseId });
-        } catch (error) {
-          debugLog(`OpenPets OpenCode plugin ignored error: ${sanitizeDebugError(error)}`);
-        }
-      });
-    } catch (error) {
-      debugLog(`OpenPets OpenCode plugin scheduling ignored error: ${sanitizeDebugError(error)}`);
-    }
-  };
-
-  const getLeaseId = async (client, requestedPetId) => {
+  const getLeaseId = async (requestedPetId) => {
     if (lease && (!lease.expiresAt || lease.expiresAt - Date.now() > 2_000)) return lease.leaseId;
     try {
       const next = await client.acquireLease({ requestedPetId });
@@ -399,24 +370,208 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
     }
   };
 
+  // ---- Send queue: serialized, latest-wins ------------------------------
+  // Sessions fire concurrently, so sends must not race: one request is in
+  // flight at a time, and a decision that arrives while an older one is
+  // still queued replaces it (the pet only ever needs the newest state).
+  let pending;
+  let draining = false;
+
+  function enqueue(decision) {
+    pending = decision;
+    // Start immediately when idle: the first decision of a burst reaches the
+    // pet right away, and the rest collapse onto it while it is in flight.
+    void drain();
+  }
+
+  async function drain() {
+    if (draining) return;
+    draining = true;
+    try {
+      while (pending) {
+        const decision = pending;
+        pending = undefined;
+        await send(decision);
+      }
+    } finally {
+      draining = false;
+    }
+  }
+
+  // The reaction this host last sent — the pet's current state, as we know it.
+  let shownReaction;
+
+  async function send(decision) {
+    const { reaction, speechCategory } = decision;
+    if (excludedReactions.has(reaction)) return;
+    try {
+      // A reaction change is a state transition: always send it. Only
+      // repeating the same reaction is damped by the persisted cooldown
+      // (which doubles as the keep-alive heartbeat), so rapid tool loops
+      // cannot pin the pet in one state.
+      const speak = speechCategory ? shouldSendSpeech(speechCategory, options) : false;
+      let react;
+      if (reaction !== shownReaction) {
+        shownReaction = reaction;
+        markThrottleKey(`reaction:${reaction}`, options);
+        react = true;
+      } else {
+        react = shouldSendReaction(reaction, options);
+      }
+      if (!speak && !react) return;
+      client ??= clientFactory();
+      const leaseId = pet ? await getLeaseId(pet) : undefined;
+      if (speak) {
+        await client.say(validateHookSpeech(pickHookSpeech(speechCategory, options.random)), { reaction, leaseId });
+        return;
+      }
+      await client.react(reaction, { leaseId });
+    } catch (error) {
+      debugLog(`OpenPets OpenCode plugin ignored error: ${sanitizeDebugError(error)}`);
+    }
+  }
+
+  // ---- Session arbitration ----------------------------------------------
+  // Mirrors openpets-dsh/index.js: one session at a time drives the pet —
+  // whoever produced the most recent event. State is per session, so
+  // concurrent sessions cannot stomp each other. When the driver goes idle
+  // the pet hands back to a still-running session instead of flashing
+  // "success" over its work; idle with nobody left behind settles "success".
+  const sessions = new Map();
+  let driverId;
+
+  // Sessions have no lifecycle end on the V2 bus (a closed session just
+  // stops emitting), so an entry without activity for this long is claimed
+  // stale and dropped.
+  const staleSessionMs = 10 * 60_000;
+
+  // Bus events carry data.sessionID; tool hooks do not identify a session.
+  const unscopedSessionId = "__unscoped__";
+
+  function sweepStaleSessions() {
+    if (sessions.size === 0) return;
+    const cutoff = Date.now() - staleSessionMs;
+    for (const [id, state] of sessions) {
+      if (state.lastEventAt > cutoff) continue;
+      sessions.delete(id);
+      if (driverId === id) driverId = undefined;
+    }
+  }
+
+  function isAnotherSessionRunning(sessionId) {
+    for (const [id, state] of sessions) {
+      if (id !== sessionId && state.running) return true;
+    }
+    return false;
+  }
+
+  function sessionState(sessionId) {
+    let state = sessions.get(sessionId);
+    if (!state) {
+      // A brand-new entry is fresh by definition: it must not be swept as
+      // stale before its first event is even recorded.
+      state = { running: false, reaction: undefined, lastEventAt: Date.now() };
+      sessions.set(sessionId, state);
+    }
+    return state;
+  }
+
+  function newestRunningSession(excludeId) {
+    let best;
+    for (const [id, state] of sessions) {
+      if (id === excludeId || !state.running) continue;
+      if (!best || state.lastEventAt > best.lastEventAt) best = { id, reaction: state.reaction };
+    }
+    return best;
+  }
+
+  // Any session we have heard from and not seen go idle.
+  function newestKnownSession(excludeId) {
+    let best;
+    for (const [id, state] of sessions) {
+      if (id === excludeId || id === unscopedSessionId) continue;
+      if (!best || state.lastEventAt > best.lastEventAt) best = { id, reaction: state.reaction };
+    }
+    return best;
+  }
+
+  // Where the pet goes when its driver stops: a session still running, else
+  // any session we have heard from without a terminal event.
+  function handoffTarget(sessionId) {
+    return newestRunningSession(sessionId) ?? newestKnownSession(sessionId);
+  }
+
+  function claimDriver(sessionId, reaction, speechCategory) {
+    sweepStaleSessions();
+    const running = sessionId === unscopedSessionId || sessions.get(sessionId)?.running === true;
+    // A straggler from a session that is not running is ignored outright: it
+    // must neither drive the pet nor leave an entry that a later hand-off
+    // would mistake for a session that is still busy.
+    if (!running && isAnotherSessionRunning(sessionId)) return;
+    const state = sessionState(sessionId);
+    state.lastEventAt = Date.now();
+    state.reaction = reaction;
+    driverId = sessionId;
+    debugLog(`OPENPETS_DECISION session=${sessionId} reaction=${reaction} speech=${speechCategory ?? ""}`);
+    enqueue({ reaction, speechCategory });
+  }
+
+  function releaseDriver(sessionId) {
+    sweepStaleSessions();
+    const state = sessionState(sessionId);
+    state.running = false;
+    state.reaction = undefined;
+    state.lastEventAt = Date.now();
+    // Session that was not driving: it must not steal the pet by going idle.
+    if (driverId !== undefined && driverId !== sessionId) {
+      sessions.delete(sessionId);
+      return;
+    }
+    const next = handoffTarget(sessionId);
+    if (next) {
+      driverId = next.id;
+      // The finished session is no longer a candidate for later hand-offs.
+      sessions.delete(sessionId);
+      enqueue({ reaction: next.reaction ?? "thinking" });
+      return;
+    }
+    driverId = undefined;
+    sessions.delete(sessionId);
+    debugLog(`OPENPETS_DECISION session=${sessionId} reaction=success speech=success`);
+    enqueue({ reaction: "success", speechCategory: "success" });
+  }
+
   return {
     event(input) {
       try {
-        run(classifyOpenCodeBusEvent(input.event));
+        const event = input?.event;
+        const type = getEventType(event);
+        if (!isRecord(event)) return;
+        const sessionIdField = getEventField(event, "sessionID");
+        const sessionId = typeof sessionIdField === "string" && sessionIdField ? sessionIdField : unscopedSessionId;
+        if (type === "session.inbox.delivered") {
+          // A user message arrived: that session is live and generating.
+          sessionState(sessionId).running = true;
+          claimDriver(sessionId, "thinking", "thinking");
+        } else if (type === "session.execution.succeeded") {
+          releaseDriver(sessionId);
+        } else if (type === "session.execution.failed") {
+          claimDriver(sessionId, "error", "error");
+        }
       } catch (error) {
         debugLog(`OpenPets OpenCode event ignored error: ${sanitizeDebugError(error)}`);
       }
     },
     "tool.execute.before"(input, output) {
-      const tool = typeof input.tool === "string" ? input.tool : "";
-      if (shouldIgnoreOpenPetsTool(tool)) return;
-      run({ reaction: classifyOpenCodeToolReaction(tool, output.args) });
+      try {
+        const tool = typeof input?.tool === "string" ? input.tool : "";
+        if (shouldIgnoreOpenPetsTool(tool)) return;
+        claimDriver(unscopedSessionId, classifyOpenCodeToolReaction(tool, output?.args));
+      } catch (error) {
+        debugLog(`OpenPets OpenCode tool hook ignored error: ${sanitizeDebugError(error)}`);
+      }
     },
   };
-}
-
-function defaultSchedule(work) {
-  queueMicrotask(() => { void work(); });
 }
 
 // --- V2 entry ---------------------------------------------------------
