@@ -47,8 +47,9 @@ coding-agent events to pet reactions:
   `@open-pets/opencode`, plus agent instructions for the OpenPets MCP tools.
 
 Both bridges can run at once and drive **different** pets, so each agent gets
-its own companion — bind each one explicitly (`pet: dafeiyu` for DSH,
-`options.pet` for OpenCode) rather than leaving it to the app's default pet.
+its own companion instead of both fighting over one window: this repo's DSH
+plugin leases `dafeiyu` by default, while an OpenCode install binds its
+plugin to another pet (`options.pet`).
 
 ## Package
 

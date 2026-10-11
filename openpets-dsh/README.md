@@ -73,17 +73,17 @@ Override the `openpets` row from the profile's `cordis.patch.yml`:
     # responseTimeoutMs: 500
 ```
 
-Schema defaults: `pet: ''`, `excludeReactions: []`, `debug: false`,
-`followSubagents: true`, `discoveryPath: ''`, `connectTimeoutMs: 500`,
-`responseTimeoutMs: 500`.
+Schema defaults: `pet: 'dafeiyu'` (大肥鱼), `excludeReactions: []`,
+`debug: false`, `followSubagents: true`, `discoveryPath: ''`,
+`connectTimeoutMs: 500`, `responseTimeoutMs: 500`.
 
-**Bind the pet explicitly when more than one agent drives OpenPets.** With
-`pet: ''` the plugin sends no lease and the app applies the reaction to
-whatever pet is currently its default — so switching the app's default
-silently re-points DSH at another pet. Set `pet` and the plugin leases that
-pet on every send instead. Two agents can then keep their own companions
-side by side, e.g. this repo's desktop profile binds DSH to `dafeiyu` while
-an OpenCode install binds its plugin to a different pet via `options.pet`.
+**The plugin leases `dafeiyu` by default, on purpose.** Two agents can drive
+two pets at once, so each host keeps its own companion instead of both
+fighting over one window: DSH leases `dafeiyu`, while an OpenCode install
+binds its plugin to a different pet via `options.pet`. Set `pet: ''` to opt
+out and fall back to whatever pet the app currently treats as its default —
+note that the reaction then follows the app's default pet, which can change
+underneath you.
 
 ## Multiple sessions
 
