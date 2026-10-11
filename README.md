@@ -46,6 +46,10 @@ coding-agent events to pet reactions:
 - **[opencode-v2/](opencode-v2/)** — OpenCode V2 port of
   `@open-pets/opencode`, plus agent instructions for the OpenPets MCP tools.
 
+Both bridges can run at once and drive **different** pets, so each agent gets
+its own companion — bind each one explicitly (`pet: dafeiyu` for DSH,
+`options.pet` for OpenCode) rather than leaving it to the app's default pet.
+
 ## Package
 
 - `dist/dafeiyu/pet.json` + `dist/dafeiyu/spritesheet.webp` — installable pet folder

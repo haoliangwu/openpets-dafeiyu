@@ -77,6 +77,14 @@ Schema defaults: `pet: ''`, `excludeReactions: []`, `debug: false`,
 `followSubagents: true`, `discoveryPath: ''`, `connectTimeoutMs: 500`,
 `responseTimeoutMs: 500`.
 
+**Bind the pet explicitly when more than one agent drives OpenPets.** With
+`pet: ''` the plugin sends no lease and the app applies the reaction to
+whatever pet is currently its default — so switching the app's default
+silently re-points DSH at another pet. Set `pet` and the plugin leases that
+pet on every send instead. Two agents can then keep their own companions
+side by side, e.g. this repo's desktop profile binds DSH to `dafeiyu` while
+an OpenCode install binds its plugin to a different pet via `options.pet`.
+
 ## Multiple sessions
 
 DSH hosts every Session in one process, so several Sessions share this single
