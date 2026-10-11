@@ -198,6 +198,8 @@ function getEventType(event) {
 // Bus types handled by the arbitration in createOpenPetsOpenCodeHooks:
 //   session.execution.succeeded  data {sessionID} — run finished; releases
 //     the driver (hands the pet to a still-running session, else "success").
+//   session.execution.interrupted data {sessionID} — user stopped the run;
+//     releases the driver with a quiet "idle" (no success speech).
 //   session.execution.failed     data {sessionID} — run failed; claims the
 //     driver with "error" + speech.
 //   session.inbox.delivered      data {sessionID, inboxID} — user message;
@@ -516,7 +518,7 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
     enqueue({ reaction, speechCategory });
   }
 
-  function releaseDriver(sessionId) {
+  function releaseDriver(sessionId, terminal = "success") {
     sweepStaleSessions();
     const state = sessionState(sessionId);
     state.running = false;
@@ -537,8 +539,8 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
     }
     driverId = undefined;
     sessions.delete(sessionId);
-    debugLog(`OPENPETS_DECISION session=${sessionId} reaction=success speech=success`);
-    enqueue({ reaction: "success", speechCategory: "success" });
+    debugLog(`OPENPETS_DECISION session=${sessionId} reaction=${terminal} speech=${terminal === "success" ? "success" : ""}`);
+    enqueue(terminal === "success" ? { reaction: "success", speechCategory: "success" } : { reaction: terminal });
   }
 
   return {
@@ -555,6 +557,12 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
           claimDriver(sessionId, "thinking", "thinking");
         } else if (type === "session.execution.succeeded") {
           releaseDriver(sessionId);
+        } else if (type === "session.execution.interrupted") {
+          // User-stopped execution: release the driver without celebrating —
+          // "success" over a stopped task would be wrong; a quiet idle clears
+          // the busy badge instead. Hand-off to a still-running session still
+          // applies, exactly like a normal idle.
+          releaseDriver(sessionId, "idle");
         } else if (type === "session.execution.failed") {
           claimDriver(sessionId, "error", "error");
         }
