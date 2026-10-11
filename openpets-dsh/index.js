@@ -1,4 +1,5 @@
 // openpets-dsh — DSH plugin driving OpenPets desktop-pet reactions.
+// Multi-session aware: see "Session arbitration" below.
 //
 // Port of the OpenCode OpenPets plugin (@open-pets/opencode@4.0.0, and its
 // V2 port in opencode-v2/openpets-v2/) to the Cordis plugin API that DSH
@@ -30,6 +31,16 @@
 // same reaction is damped by the persisted cooldown — so rapid tool loops
 // cannot pin the pet in one state, the flaw the OpenCode V1 plugin had.
 //
+// Multiple sessions share this one plugin instance, so the pet is arbitrated
+// rather than last-write-wins (see the "session arbitration" section):
+//   * every Agent keeps its own running/reaction state;
+//   * the Agent that most recently produced an event drives the pet;
+//   * an Agent going idle hands the pet back to a still-running Agent, so a
+//     finished session cannot flash "success" over another one's work;
+//   * IPC sends are serialized with latest-wins collapse — at most one
+//     request is in flight, and a newer decision replaces a queued older
+//     one, so reactions can never land out of order.
+//
 // Throttling: same reaction 10s, speech 20s, permission speech 3s;
 // persisted at ~/.local/state/openpets/dsh-hook-throttle.json (separate from
 // the OpenCode plugin's file so the two agents can run side by side).
@@ -38,7 +49,7 @@ import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import Schema from '@deepseek-ai/schemastery';
 
 export const name = 'openpets-dsh';
@@ -49,6 +60,9 @@ const REACTIONS = [
   'waiting', 'waving', 'success', 'error', 'celebrating',
 ];
 const allowedReactions = new Set(REACTIONS);
+
+// Events that carry no Agent (a bare dispatch) still need a stable key.
+const unscopedAgentId = '__unscoped__';
 
 const defaultConnectTimeoutMs = 500;
 const defaultResponseTimeoutMs = 500;
@@ -242,21 +256,70 @@ function shouldSendSpeech(category) {
   return shouldSendThrottleKey(category, cooldown);
 }
 
+// Cross-process lock: the throttle state file is shared by every DSH host
+// process; read-check-write is not atomic across processes (two sessions can
+// read the same stale timestamp, both send, and a later write clobbers the
+// other's timestamp). O_EXCL lockfile with stale theft; on lock trouble
+// proceed unlocked (best effort, throttling must never break hooks).
+function tryAcquireThrottleLock(path, timeoutMs = 2_000) {
+  const lockPath = `${path}.lock`;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      return openSync(lockPath, 'wx');
+    } catch (error) {
+      if (error?.code !== 'EEXIST') return undefined;
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > timeoutMs) {
+          unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() >= deadline) return undefined;
+      const spinUntil = Date.now() + 5;
+      while (Date.now() < spinUntil) {} // bounded busy wait, sync context
+    }
+  }
+}
+
+function releaseThrottleLock(path, lock) {
+  if (lock !== undefined) {
+    try {
+      closeSync(lock);
+    } catch {}
+  }
+  try {
+    unlinkSync(`${path}.lock`);
+  } catch {}
+}
+
 function shouldSendThrottleKey(key, cooldown) {
   const path = getDefaultThrottlePath();
-  const state = readThrottleState(path);
-  const previous = typeof state[key] === 'number' ? state[key] : 0;
-  if (Date.now() - previous < cooldown) return false;
-  state[key] = Date.now();
-  writeThrottleState(path, state);
-  return true;
+  const lock = tryAcquireThrottleLock(path);
+  try {
+    const state = readThrottleState(path);
+    const previous = typeof state[key] === 'number' ? state[key] : 0;
+    if (Date.now() - previous < cooldown) return false;
+    state[key] = Date.now();
+    writeThrottleState(path, state);
+    return true;
+  } finally {
+    releaseThrottleLock(path, lock);
+  }
 }
 
 function markThrottleKey(key) {
   const path = getDefaultThrottlePath();
-  const state = readThrottleState(path);
-  state[key] = Date.now();
-  writeThrottleState(path, state);
+  const lock = tryAcquireThrottleLock(path);
+  try {
+    const state = readThrottleState(path);
+    state[key] = Date.now();
+    writeThrottleState(path, state);
+  } finally {
+    releaseThrottleLock(path, lock);
+  }
 }
 
 function readThrottleState(path) {
@@ -297,6 +360,11 @@ function sanitizeDebugError(error) {
     .slice(0, 200);
 }
 
+function agentIdOf(payload) {
+  const id = payload?.agent?.id;
+  return typeof id === 'string' ? id : unscopedAgentId;
+}
+
 export function apply(ctx, config) {
   const debug = config?.debug === true || process.env.OPENPETS_DEBUG === '1';
   let logger;
@@ -324,10 +392,10 @@ export function apply(ctx, config) {
   let client;
   let lease;
 
-  async function getLeaseId(ipc, requestedPetId) {
+  async function getLeaseId() {
     if (lease && (!lease.expiresAt || lease.expiresAt - Date.now() > 2_000)) return lease.leaseId;
     try {
-      const next = await ipc.acquireLease({ requestedPetId });
+      const next = await client.acquireLease({ requestedPetId: pet });
       lease = { leaseId: next.leaseId, expiresAt: next.expiresAt };
       return next.leaseId;
     } catch (error) {
@@ -336,13 +404,42 @@ export function apply(ctx, config) {
     }
   }
 
+  // ---- Send queue: serialized, latest-wins ------------------------------
+  // Every DSH Session shares this instance, so sends must not race: one
+  // request is in flight at a time, and a decision that arrives while an
+  // older one is still queued replaces it (the pet only needs the newest
+  // state, never the stale one that a second socket would deliver late).
+  let queued;
+  let draining = false;
+
+  function enqueue(decision) {
+    queued = decision;
+    // Start immediately when idle: the first decision of a burst reaches the
+    // pet right away, and the rest collapse onto it while it is in flight.
+    void drain();
+  }
+
+  async function drain() {
+    if (draining) return;
+    draining = true;
+    try {
+      while (queued) {
+        const decision = queued;
+        queued = undefined;
+        await send(decision);
+      }
+    } finally {
+      draining = false;
+    }
+  }
+
   // The reaction this host last sent — the pet's current state, as we know it.
   let shownReaction;
 
   function shouldSendReaction(reaction) {
     // A reaction change is a state transition: always send it. Only repeating
-    // the same reaction is damped by the persisted cooldown, so rapid tool
-    // loops cannot pin the pet in one state.
+    // the same reaction is damped by the persisted cooldown (which doubles as
+    // the keep-alive heartbeat), so rapid tool loops cannot pin the pet.
     if (reaction !== shownReaction) {
       shownReaction = reaction;
       markThrottleKey(`reaction:${reaction}`);
@@ -351,35 +448,96 @@ export function apply(ctx, config) {
     return shouldSendThrottleKey(`reaction:${reaction}`, reactionCooldownMs);
   }
 
-  async function deliver(decision) {
-    const reaction = decision.reaction;
+  async function send(decision) {
+    if (excludedReactions.has(decision.reaction)) return;
     try {
       const shouldSpeak = decision.speechCategory ? shouldSendSpeech(decision.speechCategory) : false;
-      const shouldReact = shouldSendReaction(reaction);
+      const shouldReact = shouldSendReaction(decision.reaction);
       if (!shouldSpeak && !shouldReact) return;
       client ??= createOpenPetsClient({
         discoveryPath: config?.discoveryPath || undefined,
         connectTimeoutMs: config?.connectTimeoutMs,
         responseTimeoutMs: config?.responseTimeoutMs,
       });
-      const leaseId = pet ? await getLeaseId(client, pet) : undefined;
+      const leaseId = pet ? await getLeaseId() : undefined;
       if (decision.speechCategory && shouldSpeak) {
-        await client.say(validateHookSpeech(pickHookSpeech(decision.speechCategory)), { reaction, leaseId });
+        await client.say(validateHookSpeech(pickHookSpeech(decision.speechCategory)), {
+          reaction: decision.reaction,
+          leaseId,
+        });
         return;
       }
-      await client.react(reaction, { leaseId });
+      await client.react(decision.reaction, { leaseId });
     } catch (error) {
       debugLog(`OpenPets plugin ignored error: ${sanitizeDebugError(error)}`);
     }
   }
 
-  function run(decision) {
-    if (!decision?.reaction) return;
-    if (excludedReactions.has(decision.reaction)) return;
-    debugLog(`OPENPETS_DECISION reaction=${decision.reaction} speech=${decision.speechCategory ?? ''}`);
-    queueMicrotask(() => {
-      void deliver(decision);
-    });
+  // ---- Session arbitration ----------------------------------------------
+  // One Agent at a time drives the pet: whoever produced the most recent
+  // event. State is per Agent, so concurrent sessions cannot stomp each other
+  // and a finite agent list keeps memory from growing with the host's history.
+  const agents = new Map();
+  let driverId;
+
+  function agentState(agentId) {
+    let state = agents.get(agentId);
+    if (!state) {
+      state = { running: false, reaction: undefined, at: 0 };
+      agents.set(agentId, state);
+    }
+    return state;
+  }
+
+  function newestRunningAgent(excludeId) {
+    let bestId;
+    let bestAt = -Infinity;
+    for (const [id, state] of agents) {
+      if (id === excludeId || !state.running) continue;
+      if (state.at > bestAt) {
+        bestAt = state.at;
+        bestId = id;
+      }
+    }
+    return bestId;
+  }
+
+  function reportActive(agentId, reaction, speechCategory) {
+    const state = agentState(agentId);
+    state.at = Date.now();
+    state.reaction = reaction;
+    driverId = agentId;
+    debugLog(`OPENPETS_DECISION agent=${agentId} reaction=${reaction} speech=${speechCategory ?? ''}`);
+    enqueue({ reaction, speechCategory });
+  }
+
+  function reportRunning(agentId) {
+    agentState(agentId).running = true;
+    reportActive(agentId, 'thinking');
+  }
+
+  function reportIdle(agentId) {
+    const state = agentState(agentId);
+    state.running = false;
+    state.reaction = undefined;
+    state.at = Date.now();
+    // Session that was not driving: it must not steal the pet by going idle.
+    if (driverId !== undefined && driverId !== agentId) {
+      agents.delete(agentId);
+      return;
+    }
+    // Hand the pet to a session that is still running, so a finished session
+    // cannot flash "success" over another one's work.
+    const nextId = newestRunningAgent(agentId);
+    if (nextId !== undefined) {
+      driverId = nextId;
+      enqueue({ reaction: agents.get(nextId)?.reaction ?? 'thinking' });
+      return;
+    }
+    driverId = undefined;
+    agents.delete(agentId);
+    debugLog(`OPENPETS_DECISION agent=${agentId} reaction=success speech=success`);
+    enqueue({ reaction: 'success', speechCategory: 'success' });
   }
 
   function guarded(work) {
@@ -403,47 +561,48 @@ export function apply(ctx, config) {
   }
 
   // User message claimed by an agent -> thinking.
-  ctx.on('agent/inbox/claimed', guarded(() => {
-    run({ reaction: 'thinking', speechCategory: 'thinking' });
+  ctx.on('agent/inbox/claimed', guarded((payload) => {
+    reportActive(agentIdOf(payload), 'thinking', 'thinking');
   }));
 
-  // Agent running state. `idle` = the turn settled -> success (V1 parity:
-  // session.idle / session.execution.succeeded).
+  // Agent running state; `idle` = the turn settled.
   ctx.on('agent/status', guarded((payload) => {
-    if (payload?.status === 'running') run({ reaction: 'thinking' });
-    else if (payload?.status === 'idle') run({ reaction: 'success', speechCategory: 'success' });
+    const agentId = agentIdOf(payload);
+    if (payload?.status === 'running') reportRunning(agentId);
+    else if (payload?.status === 'idle') reportIdle(agentId);
   }));
 
   // A tool dispatch finished: on failure -> error; otherwise the agent is
   // about to generate again -> thinking.
   ctx.on('tools/result', guarded((exec, result) => {
-    if (result?.isError) run({ reaction: 'error' });
-    else run({ reaction: 'thinking' });
+    reportActive(agentIdOf(exec), result?.isError ? 'error' : 'thinking');
   }));
 
   // An LLM attempt started: the model is generating -> thinking.
   ctx.on('agent/assistant-stream', guarded((payload) => {
-    if (payload?.frame?.type === 'start') run({ reaction: 'thinking' });
+    if (payload?.frame?.type === 'start') reportActive(agentIdOf(payload), 'thinking');
   }));
 
   // Step or turn errored -> error.
-  ctx.on('agent/error', guarded(() => {
-    run({ reaction: 'error', speechCategory: 'error' });
+  ctx.on('agent/error', guarded((payload) => {
+    reportActive(agentIdOf(payload), 'error', 'error');
   }));
 
   // Tool dispatch is about to run -> classify the tool for the pet.
   onWaterfall('tools/pre-execute', (exec) => {
     if (shouldIgnoreTool(exec?.name)) return;
-    run({ reaction: classifyToolReaction(exec?.name, exec?.arguments) });
+    reportActive(agentIdOf(exec), classifyToolReaction(exec?.name, exec?.arguments));
   });
 
   // Waiting on the human: sandbox approvals and structured questions.
-  onWaterfall('approval/request', () => {
-    run({ reaction: 'waiting', speechCategory: 'permission' });
+  onWaterfall('approval/request', (request) => {
+    reportActive(agentIdOf(request), 'waiting', 'permission');
   });
-  onWaterfall('user-questions/request', () => {
-    run({ reaction: 'waiting', speechCategory: 'permission' });
+  onWaterfall('user-questions/request', (request) => {
+    reportActive(agentIdOf(request), 'waiting', 'permission');
   });
 
-  debugLog(`OpenPets DSH bridge loaded (pet=${pet ?? 'default'}, reactions excluded: ${[...excludedReactions].join(',') || 'none'})`);
+  debugLog(
+    `OpenPets DSH bridge loaded (pet=${pet ?? 'default'}, reactions excluded: ${[...excludedReactions].join(',') || 'none'})`,
+  );
 }

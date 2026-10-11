@@ -72,6 +72,22 @@ Override the `openpets` row from the profile's `cordis.patch.yml`:
 Schema defaults: `pet: ''`, `excludeReactions: []`, `debug: false`,
 `discoveryPath: ''`, `connectTimeoutMs: 500`, `responseTimeoutMs: 500`.
 
+## Multiple sessions
+
+DSH hosts every Session in one process, so several Sessions share this single
+plugin instance. The pet is arbitrated rather than last-write-wins:
+
+- **Per-session state.** Each Agent's running/reaction state is tracked
+  separately; concurrent sessions cannot stomp each other.
+- **One driver.** The Agent that produced the most recent event drives the
+  pet.
+- **Idle hands off.** When the driver goes idle while another Agent is still
+  running, the pet switches to that Agent's state instead of flashing
+  "success" over its work. "success" only fires when nothing is running.
+- **Serialized sends.** At most one IPC request is in flight, and a decision
+  that arrives while another is in flight collapses to the newest one — so a
+  slower socket can never deliver a stale reaction after a newer one.
+
 ## Throttling
 
 A reaction change is a state transition: always sent. Repeating the same
@@ -79,6 +95,19 @@ reaction is damped 10 s (a keep-alive heartbeat), speech 20 s, permission
 speech 3 s. State persists at
 `~/.local/state/openpets/dsh-hook-throttle.json` — separate from the
 OpenCode plugin's file, so both agents can run side by side.
+
+## Testing
+
+```sh
+pnpm test          # node --test test/*.test.mjs
+```
+
+The suite starts a fake OpenPets app on a real Unix socket
+(`test/fake-openpets.mjs`) and drives the plugin's actual event handlers
+against it, asserting what the app receives: send order, concurrency
+(`maxInFlight` stays 1), latest-wins collapse, multi-session hand-off,
+reaction damping, exclusions, ignored OpenPets tools, lease-before-react,
+and that waterfall handlers forward `next()` untouched.
 
 ## Uninstall / disable
 
@@ -104,7 +133,9 @@ watch roots (base HMR ships with `root: []`, i.e. no source watching, and a
 
 With that in place, edits to `index.js` hot-reload the running plugin — no
 app restart. Watch the effect in
-`~/.local/state/openpets/dsh-hook-throttle.json`.
+`~/.local/state/openpets/dsh-hook-throttle.json`. If a change seems not to
+land, touch the file again: the watcher coalesces events, and a reload that
+arrives while the host is busy can be missed once.
 
 Dependency: `@deepseek-ai/schemastery` (for the `Config` schema) — run
 `pnpm install` in this folder after cloning.
