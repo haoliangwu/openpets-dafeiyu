@@ -54,7 +54,7 @@ let s = fs.readFileSync(f, 'utf8');
 if (s.includes('centre-exclusion')) { console.log('controller already patched'); process.exit(0); }
 const OLD_IMPORT = 'import { shell } from "electron";';
 if (!s.includes(OLD_IMPORT)) { console.error('electron import pattern not found'); process.exit(2); }
-s = s.replace(OLD_IMPORT, 'import { shell, screen as getScreen } from "electron";');
+s = s.replace(OLD_IMPORT, 'import { shell, screen as electronScreen } from "electron";');
 const OLD_WANDER = `    const distance = clampNumber(Number(options.distance ?? 80), 0, maxPluginMoveDistance);
     const angle = Math.random() * Math.PI * 2;
     const current = readWindowPosition(defaultPetWindow);
@@ -72,7 +72,7 @@ const NEW_WANDER = `    const distance = clampNumber(Number(options.distance ?? 
     // the visible sprite inside the central third of the work area, keeping
     // the middle of the screen clear. After 6 rejected rolls: stay put.
     let rawTarget = null;
-    const display = getScreen().getDisplayNearestPoint({ x: current.x + defaultPetWindowSize.width / 2, y: current.y + defaultPetWindowSize.height / 2 });
+    const display = electronScreen.getDisplayNearestPoint({ x: current.x + defaultPetWindowSize.width / 2, y: current.y + defaultPetWindowSize.height / 2 });
     const workArea = display.workArea;
     const cx0 = workArea.x + workArea.width * 0.33;
     const cx1 = workArea.x + workArea.width * 0.67;
