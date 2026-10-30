@@ -3,12 +3,14 @@
 # patch-openpets-smooth.sh; this script assumes the app is NOT otherwise
 # patched — it applies cleanly to a stock or smooth-patched app.asar).
 #
-# 1. Wander centre-exclusion (dist/default-pet-controller.js):
-#    applyExternalPetWander re-rolls the random hop angle when the resulting
-#    sprite box would land inside the central third of the display's work
-#    area; after 6 rejected rolls the pet simply stays put. The walkabout
-#    plugin (or any pet.wander caller) keeps working but the screen centre
-#    stays clear.
+# 1. Wander behaviour (dist/default-pet-controller.js), two parts:
+#    a) Wander is allowed while a status badge or transient bubble shows
+#       (both travel with the pet window); previously "status-active" and
+#       "transient-display" hard-blocked all wander — with an OpenCode
+#       session running the busy badge made the pet never move.
+#    b) Edge-seeking hop selection: sample 6 random hops, take the one whose
+#       sprite centre lands FARTHEST from the work-area centre. The pet still
+#       roams freely but avoids drifting to the middle of the screen.
 # 2. Top reach (dist/display.js): clampIntoWorkArea lets the pet WINDOW rise
 #    up to 190px above the work-area top — the visible sprite is anchored at
 #    the window bottom with ~190px of bubble headroom above, so the sprite
@@ -51,7 +53,7 @@ node - "$CTRL" <<'EOF'
 const fs = require('fs');
 const f = process.argv[2];
 let s = fs.readFileSync(f, 'utf8');
-if (s.includes('centre-exclusion')) { console.log('controller already patched'); process.exit(0); }
+if (s.includes('Edge-seeking')) { console.log('controller already patched'); process.exit(0); }
 const OLD_IMPORT = 'import { shell } from "electron";';
 if (!s.includes(OLD_IMPORT)) { console.error('electron import pattern not found'); process.exit(2); }
 s = s.replace(OLD_IMPORT, 'import { shell, screen as electronScreen } from "electron";');
@@ -68,38 +70,51 @@ if (!s.includes(OLD_WANDER)) { console.error('wander block pattern not found —
 const NEW_WANDER = `    const distance = clampNumber(Number(options.distance ?? 80), 0, maxPluginMoveDistance);
     const durationMs = clampNumber(Number(options.durationMs ?? 700), minPluginMoveDurationMs, maxPluginMoveDurationMs);
     const current = readWindowPosition(defaultPetWindow);
-    // Screen-centre exclusion zone: re-roll wander hops whose target would put
-    // the visible sprite inside the central third of the work area, keeping
-    // the middle of the screen clear. After 6 rejected rolls: stay put.
-    let rawTarget = null;
+    // Edge-seeking wander: sample several random hops and take the one whose
+    // sprite centre lands FARTHEST from the work-area centre. The pet still
+    // roams freely (never trapped on one side), but drift toward the middle
+    // of the screen loses to hops that head toward the edges.
     const display = electronScreen.getDisplayNearestPoint({ x: current.x + defaultPetWindowSize.width / 2, y: current.y + defaultPetWindowSize.height / 2 });
     const workArea = display.workArea;
-    const cx0 = workArea.x + workArea.width * 0.33;
-    const cx1 = workArea.x + workArea.width * 0.67;
-    const cy0 = workArea.y + workArea.height * 0.33;
-    const cy1 = workArea.y + workArea.height * 0.67;
+    const workAreaCentreX = workArea.x + workArea.width / 2;
+    const workAreaCentreY = workArea.y + workArea.height / 2;
+    let rawTarget = null;
+    let bestDistance = -1;
     for (let attempt = 0; attempt < 6; attempt++) {
         const angle = Math.random() * Math.PI * 2;
         const candidate = {
             x: current.x + Math.cos(angle) * distance,
             y: current.y + Math.sin(angle) * distance,
         };
-        const spriteTop = candidate.y + defaultPetWindowSize.height - 230;
-        const spriteBottom = candidate.y + defaultPetWindowSize.height - 22;
         const spriteCentreX = candidate.x + defaultPetWindowSize.width / 2;
-        const inCentreX = spriteCentreX > cx0 && spriteCentreX < cx1;
-        const inCentreY = spriteBottom > cy0 && spriteTop < cy1;
-        if (!(inCentreX && inCentreY)) {
+        const spriteCentreY = candidate.y + 294; // sprite box spans y+190..y+398
+        const dist = Math.hypot(spriteCentreX - workAreaCentreX, spriteCentreY - workAreaCentreY);
+        if (dist > bestDistance) {
+            bestDistance = dist;
             rawTarget = candidate;
-            break;
         }
-    }
-    if (!rawTarget) {
-        debug("pet.default", "wander skipped", { reason: "centre-exclusion" });
-        return Promise.resolve({ moved: false, reason: "centre-exclusion" });
     }
     const target = getSafeDefaultPetPosition(rawTarget);`;
 s = s.replace(OLD_WANDER, NEW_WANDER);
+// b) un-block wander while a badge/bubble is showing (they travel with the window)
+const OLD_GATE = `    const blockedReason = getMovementBlockedReason(defaultPetWindow);
+    if (blockedReason) {
+        debug("pet.default", "wander skipped", { reason: blockedReason });
+        return Promise.resolve({ moved: false, reason: blockedReason });
+    }
+    const distance = clampNumber`;
+const NEW_GATE = `    const blockedReason = getMovementBlockedReason(defaultPetWindow);
+    // Wander is allowed while a status badge or transient bubble is showing:
+    // both are drawn inside the pet window and travel with it, and the
+    // Walkabout plugin's pauseWhenBusy:false asks for motion during busy
+    // periods. Keep blocking on dragging/hidden/paused/already-moving.
+    if (blockedReason && blockedReason !== "status-active" && blockedReason !== "transient-display") {
+        debug("pet.default", "wander skipped", { reason: blockedReason });
+        return Promise.resolve({ moved: false, reason: blockedReason });
+    }
+    const distance = clampNumber`;
+if (!s.includes(OLD_GATE)) { console.error('wander gate pattern not found — version changed'); process.exit(2); }
+s = s.replace(OLD_GATE, NEW_GATE);
 fs.writeFileSync(f, s);
 console.log('controller patched (centre-exclusion wander)');
 EOF
