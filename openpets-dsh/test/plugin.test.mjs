@@ -60,15 +60,15 @@ async function emitPaced(ctx, event, ...args) {
   await emitAfter(ctx, 30, event, ...args);
 }
 
-/** Wait for all queued decisions to reach the fake pet. */
-async function drainSends(fake) {
-  const before = fake.reactions().length;
-  for (let i = 0; i < 50; i += 1) {
+/** Wait until the plugin stops sending (no new reaction for two samples). */
+async function waitForSends(fake) {
+  let seen = fake.reactions().length;
+  let quiet = 0;
+  for (let i = 0; i < 50 && quiet < 2; i += 1) {
     await delay(20);
-    if (fake.reactions().length > before) {
-      await delay(60);
-      return;
-    }
+    const now = fake.reactions().length;
+    quiet = now === seen ? quiet + 1 : 0;
+    seen = now;
   }
 }
 
@@ -269,45 +269,66 @@ test('waterfall handlers forward next() and its result untouched', async (t) => 
   assert.deepEqual(fake.reactions(), ['editing', 'waiting']);
 });
 
-test('waiting locks the pet until the user answers', async (t) => {
+test('a prompt holds the pet on waiting and hides busy noise', async (t) => {
   const { fake, ctx } = await loadPlugin(t);
 
-  // The agent is running, then asks for approval.
   await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'running' });
-  assert.equal(ctx.emit('approval/request', { agent: { id: 'agent-a' } }, () => 'NEXT'), 'NEXT');
-  await drainSends(fake);
+  // Approvals carry no Agent id: the wait is attributed to the driving Agent.
+  assert.equal(ctx.emit('approval/request', {}, () => 'NEXT'), 'NEXT');
+  await waitForSends(fake);
   assert.deepEqual(fake.reactions(), ['thinking', 'waiting']);
 
-  // Busy events while blocked must NOT overwrite the waiting state. The
-  // assistant-stream start doubles as an unlock signal, so it is excluded
-  // here (a real blocked agent emits no stream); tools/result and
-  // tools/pre-execute are the busy noise that must be damped.
-  await emitPaced(ctx, 'tools/result', tool('edit'), { isError: false });
+  // Busy noise from the blocked Agent must not overwrite the one state the
+  // user needs to notice.
+  await emitPaced(ctx, 'tools/result', tool('edit'), { isError: true });
+  await waitForSends(fake);
+  assert.deepEqual(fake.reactions(), ['thinking', 'waiting']);
+
+  // The approved tool's own dispatch proves the wait ended.
   await emitPaced(ctx, 'tools/pre-execute', tool('edit'), () => {});
-  await delay(50);
-  assert.deepEqual(fake.reactions(), ['thinking', 'waiting']);
-
-  // The reply arrives: the lock lifts and normal updates resume.
-  await emitPaced(ctx, 'approval/responded', { agent: { id: 'agent-a' } });
-  await drainSends(fake);
-  assert.deepEqual(fake.reactions(), ['thinking', 'waiting', 'thinking']);
+  await waitForSends(fake);
+  assert.deepEqual(fake.reactions(), ['thinking', 'waiting', 'editing']);
 });
 
-test('waiting locks across an agent going idle while blocked', async (t) => {
+test('a settled turn cannot hold the wait', async (t) => {
   const { fake, ctx } = await loadPlugin(t);
 
   await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'running' });
-  assert.equal(ctx.emit('user-questions/request', { agent: { id: 'agent-a' } }, () => 'NEXT'), 'NEXT');
-  await drainSends(fake);
+  assert.equal(ctx.emit('user-questions/request', {}, () => 'NEXT'), 'NEXT');
+  await waitForSends(fake);
   assert.deepEqual(fake.reactions(), ['thinking', 'waiting']);
 
-  // A stale idle from the waiting agent must not flash success over waiting.
+  // A denied/abandoned prompt ends the turn: the pet must settle, not stick.
   await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'idle' });
-  await delay(50);
-  assert.deepEqual(fake.reactions(), ['thinking', 'waiting']);
+  await waitForSends(fake);
+  assert.deepEqual(fake.reactions(), ['thinking', 'waiting', 'success']);
+});
 
-  // A new model stream proves the wait ended: unlock, back to thinking.
-  await emitPaced(ctx, 'agent/assistant-stream', { agent: { id: 'agent-a' }, frame: { type: 'start' } });
-  await drainSends(fake);
-  assert.deepEqual(fake.reactions(), ['thinking', 'waiting', 'thinking']);
+test('a waiting session does not freeze another session', async (t) => {
+  const { fake, ctx } = await loadPlugin(t);
+
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'running' });
+  assert.equal(ctx.emit('approval/request', {}, () => 'NEXT'), 'NEXT');
+  await waitForSends(fake);
+
+  // Agent B keeps working; the wait belongs to agent-a only.
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-b' }, status: 'running' });
+  await emitPaced(ctx, 'tools/pre-execute', { ...tool('bash'), agent: { id: 'agent-b' } }, () => {});
+  // …and agent-a's own noise is still dropped.
+  await emitPaced(ctx, 'tools/result', { ...tool('edit'), agent: { id: 'agent-a' } }, { isError: true });
+  await waitForSends(fake);
+
+  assert.deepEqual(fake.reactions(), ['thinking', 'waiting', 'thinking', 'running']);
+});
+
+test('disposing a waiting session settles the pet', async (t) => {
+  const { fake, ctx } = await loadPlugin(t);
+
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'running' });
+  assert.equal(ctx.emit('approval/request', {}, () => 'NEXT'), 'NEXT');
+  await waitForSends(fake);
+
+  await emitPaced(ctx, 'agent/disposed', { agent: { id: 'agent-a' } });
+  await waitForSends(fake);
+  assert.deepEqual(fake.reactions(), ['thinking', 'waiting', 'success']);
 });

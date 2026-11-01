@@ -33,8 +33,8 @@ port in `../opencode-v2/`) to the Cordis plugin API that DSH hosts run.
 | `tools/pre-execute` — any other tool | working | — |
 | `tools/result` success | thinking (agent resumes generating) | — |
 | `tools/result` with `isError` | error | — |
-| `approval/request`, `user-questions/request` | waiting — **locks the pet** until answered | "Approval needed" |
-| `approval/responded`, `user-questions/responded`, `agent/inbox/claimed`, new `assistant-stream` start | unlock, resume normal updates | — |
+| `approval/request`, `user-questions/request` | waiting — **holds that session's pet state** until the wait ends | "Approval needed" |
+| `agent/inbox/claimed`, new `assistant-stream` start, the next `tools/pre-execute`, `agent/status` idle, `agent/disposed` | wait ends, normal updates resume | — |
 | `subagent/start` (a delegated child run) | working (the child drives until it settles) | — |
 | `subagent/end` | hands the pet back to whatever is still busy | — |
 | `agent/disposed` (session left the registry) | releases the pet | — |
@@ -101,6 +101,11 @@ plugin instance. The pet is arbitrated rather than last-write-wins:
 - **No stragglers.** An event from a Session that is not running cannot pull
   the pet away from one that is still working. Host-level and interrupt
   events, which arrive without an Agent id, still can.
+- **Waiting is per-session.** While one session blocks on an approval or a
+  question, its own busy events are dropped so the prompt stays visible — but
+  another session keeps driving the pet. The wait ends with the next message,
+  the model resuming, the next tool dispatch, the turn settling, or the
+  session going away, so it can never outlive the wait.
 - **Stale sessions reclaimed.** A Session that dies without an idle event is
   reclaimed after 10 minutes of silence — its entry and the driver seat — so
   the pet cannot get stuck on a reaction nobody will ever update.
