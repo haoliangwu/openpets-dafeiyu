@@ -486,6 +486,11 @@ export function apply(ctx, config) {
   const agents = new Map();
   let driverId;
 
+  // Set while the agent is blocked on a human answer (approval/request,
+  // user-questions/request). While set, busy reactions are deferred (see
+  // claimDriver) so "waiting" stays on the pet until the user answers.
+  let waitingOnAnswer = false;
+
   // Child SessionIds currently delegating. Needed to recognise a subagent's
   // own Agent events when `followSubagents` is off.
   const children = new Set();
@@ -577,7 +582,8 @@ export function apply(ctx, config) {
     // While blocked on a human answer the pet must stay "waiting": busy
     // events from background work (tool retries, other agents) would
     // otherwise overwrite the one state the user needs to notice. They are
-    // deferred, and normal updates resume when the answer arrives.
+    // dropped, not replayed; the next event after the unlock becomes the
+    // new state.
     if (waitingOnAnswer && reaction !== "waiting") {
       debugLog(`OPENPETS_DECISION agent=${agentId} reaction=${reaction} deferred (waiting on user)`);
       return;
@@ -590,11 +596,6 @@ export function apply(ctx, config) {
   // A session stops driving: it goes idle, or (for a delegation) its child
   // settles. The pet then moves to whatever is still busy rather than flashing
   // "success" over another session's work.
-  // While blocked on the human (approval/request, user-questions/request) the
-  // pet is locked to "waiting": busy events from background work would
-  // otherwise overwrite the one state the user needs to notice.
-  let waitingOnAnswer = false;
-
   function releaseDriver(agentId) {
     sweepStaleAgents();
     const state = agentState(agentId);
@@ -603,8 +604,11 @@ export function apply(ctx, config) {
     state.lastEventAt = Date.now();
     // A stale idle while the agent is actually blocked on the user must not
     // flash "success" over the waiting state the user still needs to see.
+    // The entry is dropped but the driver seat is vacated too: a ghost driver
+    // would block every later hand-off until the stale sweep.
     if (waitingOnAnswer) {
       agents.delete(agentId);
+      if (driverId === agentId) driverId = undefined;
       debugLog(`OPENPETS_DECISION agent=${agentId} idle deferred (waiting on user)`);
       return;
     }
@@ -707,13 +711,17 @@ export function apply(ctx, config) {
   // The answer arrived: resume normal updates. (A claimed inbox message
   // also unlocks — that is handled at the earlier agent/inbox/claimed
   // listener.)
-  ctx.on('approval/responded', guarded((payload) => {
+  // The answer arrived: lift the waiting lock and resume normal updates.
+  function unlockAndThink(agentId) {
     waitingOnAnswer = false;
-    claimDriver(agentIdOf(payload), 'thinking');
+    claimDriver(agentId, 'thinking');
+  }
+
+  ctx.on('approval/responded', guarded((payload) => {
+    unlockAndThink(agentIdOf(payload));
   }));
   ctx.on('user-questions/responded', guarded((payload) => {
-    waitingOnAnswer = false;
-    claimDriver(agentIdOf(payload), 'thinking');
+    unlockAndThink(agentIdOf(payload));
   }));
 
   // A delegation started: mark the child as running and let it drive the pet.

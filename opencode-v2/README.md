@@ -14,7 +14,7 @@ V2 plugin API, since upstream has not shipped a V2-compatible release.
   puts the pet in "waiting" and locks it: later busy events from the same
   turn are remembered but not shown, so the state that needs the user's
   attention is not overwritten. `permission.replied`, a new user message,
-  or the next tool/model step unlocks it.
+  or the next tool step unlocks it.
 - **Known approximation.** V2 has no `chat.message` hook, so "thinking" is
   triggered from `message.updated` events with `info.role === "user"`.
 

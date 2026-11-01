@@ -17,6 +17,8 @@ import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unl
 export const openPetsPluginId = "openpets";
 
 const speechCooldownMs = 20_000;
+// Asking again right after a previous ask is the same block: short cooldown.
+const permissionCooldownMs = 3_000;
 const reactionCooldownMs = 10_000;
 
 const allowedReactions = new Set([
@@ -170,6 +172,11 @@ export function shouldIgnoreOpenPetsTool(toolName) {
   );
 }
 
+// Tools that block on a human answer — same waiting lock as permission.asked.
+export function isBlockingQuestionTool(toolName) {
+  return toolName === "question" || toolName === "ask" || toolName === "ask_followup" || toolName === "ask_for_user_input";
+}
+
 export function classifyOpenCodeToolReaction(toolName, args) {
   const normalized = toolName.toLowerCase();
   if (/edit|write|patch|apply_patch/.test(normalized)) return "editing";
@@ -222,7 +229,10 @@ function getDefaultOpenCodeThrottlePath() {
 
 function shouldSendSpeech(category, options) {
   const now = options.now?.() ?? Date.now();
-  return shouldSendThrottleKey(category, speechCooldownMs, now, options.throttlePath ?? getDefaultOpenCodeThrottlePath());
+  // Permission asks use a shorter cooldown so a re-ask still speaks, matching
+  // the DSH plugin (openpets-dsh uses 3 s for the same category).
+  const cooldown = category === "permission" ? permissionCooldownMs : speechCooldownMs;
+  return shouldSendThrottleKey(category, cooldown, now, options.throttlePath ?? getDefaultOpenCodeThrottlePath());
 }
 
 function shouldSendReaction(reaction, options) {
@@ -432,6 +442,10 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
       const leaseId = pet ? await getLeaseId(pet) : undefined;
       if (speak) {
         await client.say(validateHookSpeech(pickHookSpeech(speechCategory, options.random)), { reaction, leaseId });
+        // The speech carried the reaction: when it is the ONLY channel fired
+        // (no react call), the say's own reaction field must still count as
+        // the shown state — a later identical reaction otherwise looks like a
+        // repeat and gets damped, leaving the pet stale.
         return;
       }
       await client.react(reaction, { leaseId });
@@ -528,7 +542,8 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
     // While blocked on a human answer the pet must stay "waiting": busy
     // events from background work (tool retries, telemetry, other agents)
     // would otherwise overwrite the one state the user needs to notice.
-    // They are remembered, not shown, and resume on unlock.
+    // They are dropped, not replayed; the next event after the unlock
+    // becomes the new state.
     if (waitingOnAnswer && reaction !== "waiting") {
       debugLog(`OPENPETS_DECISION session=${sessionId} reaction=${reaction} deferred (waiting on user)`);
       return;
@@ -546,7 +561,8 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
     state.lastEventAt = Date.now();
     // A stale idle while the session is actually blocked on the user must
     // not flash "success" over the waiting state the user still needs to see.
-    // The driver is left in place so a later hand-off cannot skip the wait.
+    // The entry is dropped and the driver seat vacated so a later claim can
+    // take over; the lock itself only lifts on an actual answer.
     if (waitingOnAnswer) {
       sessions.delete(sessionId);
       if (driverId === sessionId) driverId = undefined;
@@ -618,11 +634,15 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
         if (shouldIgnoreOpenPetsTool(tool)) return;
         // The question tool blocks on the user just like permission.asked:
         // claim "waiting" with the lock so busy events cannot overwrite it.
-        if (tool === "question" || tool === "ask" || tool === "ask_followup" || tool === "ask_for_user_input") {
+        if (isBlockingQuestionTool(tool)) {
           waitingOnAnswer = true;
           claimDriver(unscopedSessionId, "waiting", "permission");
           return;
         }
+        // Any other tool actually running proves a previous question was
+        // answered (its result arrives as a tool result, not permission
+        // events) — fallback unlock so the lock cannot outlive the turn.
+        waitingOnAnswer = false;
         claimDriver(unscopedSessionId, classifyOpenCodeToolReaction(tool, output?.args));
       } catch (error) {
         debugLog(`OpenPets OpenCode tool hook ignored error: ${sanitizeDebugError(error)}`);
