@@ -10,6 +10,11 @@ V2 plugin API, since upstream has not shipped a V2-compatible release.
   reactions/speech through the OpenPets desktop app's local IPC (Unix
   socket, lease-based). Reaction cooldown 10 s, speech 20 s, persisted at
   `~/.local/state/openpets/opencode-hook-throttle.json`.
+- **Waiting lock.** `permission.asked` (and the `question` / `ask*` tool)
+  puts the pet in "waiting" and locks it: later busy events from the same
+  turn are remembered but not shown, so the state that needs the user's
+  attention is not overwritten. `permission.replied`, a new user message,
+  or the next tool/model step unlocks it.
 - **Known approximation.** V2 has no `chat.message` hook, so "thinking" is
   triggered from `message.updated` events with `info.role === "user"`.
 

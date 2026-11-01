@@ -574,6 +574,14 @@ export function apply(ctx, config) {
     const state = agentState(agentId);
     state.lastEventAt = Date.now();
     state.reaction = reaction;
+    // While blocked on a human answer the pet must stay "waiting": busy
+    // events from background work (tool retries, other agents) would
+    // otherwise overwrite the one state the user needs to notice. They are
+    // deferred, and normal updates resume when the answer arrives.
+    if (waitingOnAnswer && reaction !== "waiting") {
+      debugLog(`OPENPETS_DECISION agent=${agentId} reaction=${reaction} deferred (waiting on user)`);
+      return;
+    }
     driverId = agentId;
     logDecision(agentId, reaction, speechCategory);
     enqueue({ reaction, speechCategory });
@@ -582,12 +590,24 @@ export function apply(ctx, config) {
   // A session stops driving: it goes idle, or (for a delegation) its child
   // settles. The pet then moves to whatever is still busy rather than flashing
   // "success" over another session's work.
+  // While blocked on the human (approval/request, user-questions/request) the
+  // pet is locked to "waiting": busy events from background work would
+  // otherwise overwrite the one state the user needs to notice.
+  let waitingOnAnswer = false;
+
   function releaseDriver(agentId) {
     sweepStaleAgents();
     const state = agentState(agentId);
     state.running = false;
     state.reaction = undefined;
     state.lastEventAt = Date.now();
+    // A stale idle while the agent is actually blocked on the user must not
+    // flash "success" over the waiting state the user still needs to see.
+    if (waitingOnAnswer) {
+      agents.delete(agentId);
+      debugLog(`OPENPETS_DECISION agent=${agentId} idle deferred (waiting on user)`);
+      return;
+    }
     // Session that was not driving: it must not steal the pet by going idle.
     if (driverId !== undefined && driverId !== agentId) {
       agents.delete(agentId);
@@ -627,8 +647,11 @@ export function apply(ctx, config) {
     });
   }
 
-  // User message claimed by an agent -> thinking.
+  // User message claimed by an agent -> thinking. It also means any pending
+  // approval/question was answered (or the user took over), so the waiting
+  // lock must not survive it.
   ctx.on('agent/inbox/claimed', guarded((payload) => {
+    waitingOnAnswer = false;
     claimDriver(agentIdOf(payload), 'thinking', 'thinking');
   }));
 
@@ -649,9 +672,14 @@ export function apply(ctx, config) {
     claimDriver(agentIdOf(exec), result?.isError ? 'error' : 'thinking');
   }));
 
-  // An LLM attempt started: the model is generating -> thinking.
+  // An LLM attempt started: the model is generating -> thinking. It also
+  // proves any pending wait ended (the answer or a new message unblocked
+  // the loop), so the waiting lock must not survive it.
   ctx.on('agent/assistant-stream', guarded((payload) => {
-    if (payload?.frame?.type === 'start') claimDriver(agentIdOf(payload), 'thinking');
+    if (payload?.frame?.type === 'start') {
+      waitingOnAnswer = false;
+      claimDriver(agentIdOf(payload), 'thinking');
+    }
   }));
 
   // Step or turn errored -> error.
@@ -665,13 +693,28 @@ export function apply(ctx, config) {
     claimDriver(agentIdOf(exec), classifyToolReaction(exec?.name, exec?.arguments));
   });
 
-  // Waiting on the human: sandbox approvals and structured questions.
+  // Waiting on the human: sandbox approvals and structured questions. The
+  // pet locks to "waiting" until the user answers: a new inbox message or
+  // the agent resuming work is what unlocks it.
   onWaterfall('approval/request', (request) => {
+    waitingOnAnswer = true;
     claimDriver(agentIdOf(request), 'waiting', 'permission');
   });
   onWaterfall('user-questions/request', (request) => {
+    waitingOnAnswer = true;
     claimDriver(agentIdOf(request), 'waiting', 'permission');
   });
+  // The answer arrived: resume normal updates. (A claimed inbox message
+  // also unlocks — that is handled at the earlier agent/inbox/claimed
+  // listener.)
+  ctx.on('approval/responded', guarded((payload) => {
+    waitingOnAnswer = false;
+    claimDriver(agentIdOf(payload), 'thinking');
+  }));
+  ctx.on('user-questions/responded', guarded((payload) => {
+    waitingOnAnswer = false;
+    claimDriver(agentIdOf(payload), 'thinking');
+  }));
 
   // A delegation started: mark the child as running and let it drive the pet.
   // In-process children are Agents too, so their own events follow; providers

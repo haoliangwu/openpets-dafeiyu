@@ -25,11 +25,13 @@ const allowedReactions = new Set([
 ]);
 
 // Speech pools cloned from @open-pets/agent-events@4.0.0 (hookSpeechPools).
-// The V1 "permission" pool is not ported: V2 emits no permission.asked event.
+// The V1 "permission" pool is served by the V2 bus events permission.asked /
+// permission.replied plus the ask/question tool.execute.before hook.
 const hookSpeechPools = {
   thinking: ["Thinking it through", "Let me check", "On it", "Working it out"],
   success: ["Done", "That worked", "All set", "Nice, finished"],
   error: ["Something failed", "Needs another look", "Hit a snag", "Not quite there"],
+  permission: ["Approval needed", "Waiting on you", "Need your input"],
 };
 
 const SESSION_NONCE = randomUUID();
@@ -204,6 +206,11 @@ function getEventType(event) {
 //     driver with "error" + speech.
 //   session.inbox.delivered      data {sessionID, inboxID} — user message;
 //     marks the session running and claims the driver with "thinking".
+//   permission.asked             data {sessionID, id, action, ...} — the
+//     agent is blocked on the human; claims "waiting" and LOCKS the pet so
+//     later busy events cannot overwrite the one state the user must notice.
+//   permission.replied           data {sessionID, requestID, reply} — the
+//     answer arrived; unlocks and resumes normal updates.
 
 function getDefaultOpenCodeThrottlePath() {
   if (process.platform === "win32")
@@ -442,6 +449,11 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
   const sessions = new Map();
   let driverId;
 
+  // Set while the agent is blocked on a human answer (permission.asked).
+  // While set, busy reactions are deferred (see claimDriver) so "waiting"
+  // stays on the pet until the user actually replies.
+  let waitingOnAnswer = false;
+
   // Sessions have no lifecycle end on the V2 bus (a closed session just
   // stops emitting), so an entry without activity for this long is claimed
   // stale and dropped.
@@ -513,6 +525,14 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
     const state = sessionState(sessionId);
     state.lastEventAt = Date.now();
     state.reaction = reaction;
+    // While blocked on a human answer the pet must stay "waiting": busy
+    // events from background work (tool retries, telemetry, other agents)
+    // would otherwise overwrite the one state the user needs to notice.
+    // They are remembered, not shown, and resume on unlock.
+    if (waitingOnAnswer && reaction !== "waiting") {
+      debugLog(`OPENPETS_DECISION session=${sessionId} reaction=${reaction} deferred (waiting on user)`);
+      return;
+    }
     driverId = sessionId;
     debugLog(`OPENPETS_DECISION session=${sessionId} reaction=${reaction} speech=${speechCategory ?? ""}`);
     enqueue({ reaction, speechCategory });
@@ -524,6 +544,15 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
     state.running = false;
     state.reaction = undefined;
     state.lastEventAt = Date.now();
+    // A stale idle while the session is actually blocked on the user must
+    // not flash "success" over the waiting state the user still needs to see.
+    // The driver is left in place so a later hand-off cannot skip the wait.
+    if (waitingOnAnswer) {
+      sessions.delete(sessionId);
+      if (driverId === sessionId) driverId = undefined;
+      debugLog(`OPENPETS_DECISION session=${sessionId} idle deferred (waiting on user)`);
+      return;
+    }
     // Session that was not driving: it must not steal the pet by going idle.
     if (driverId !== undefined && driverId !== sessionId) {
       sessions.delete(sessionId);
@@ -553,8 +582,21 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
         const sessionId = typeof sessionIdField === "string" && sessionIdField ? sessionIdField : unscopedSessionId;
         if (type === "session.inbox.delivered") {
           // A user message arrived: that session is live and generating.
+          // It also means any pending permission was answered (or the user
+          // took over), so the waiting lock must not survive it.
+          waitingOnAnswer = false;
           sessionState(sessionId).running = true;
           claimDriver(sessionId, "thinking", "thinking");
+        } else if (type === "permission.asked") {
+          // The agent is blocked on the human: claim the pet as "waiting"
+          // and lock it — subsequent busy events must not overwrite the one
+          // state the user needs to notice.
+          waitingOnAnswer = true;
+          sessionState(sessionId).running = true;
+          claimDriver(sessionId, "waiting", "permission");
+        } else if (type === "permission.replied") {
+          waitingOnAnswer = false;
+          claimDriver(sessionId, "thinking");
         } else if (type === "session.execution.succeeded") {
           releaseDriver(sessionId);
         } else if (type === "session.execution.interrupted") {
@@ -574,6 +616,13 @@ export function createOpenPetsOpenCodeHooks(options = {}) {
       try {
         const tool = typeof input?.tool === "string" ? input.tool : "";
         if (shouldIgnoreOpenPetsTool(tool)) return;
+        // The question tool blocks on the user just like permission.asked:
+        // claim "waiting" with the lock so busy events cannot overwrite it.
+        if (tool === "question" || tool === "ask" || tool === "ask_followup" || tool === "ask_for_user_input") {
+          waitingOnAnswer = true;
+          claimDriver(unscopedSessionId, "waiting", "permission");
+          return;
+        }
         claimDriver(unscopedSessionId, classifyOpenCodeToolReaction(tool, output?.args));
       } catch (error) {
         debugLog(`OpenPets OpenCode tool hook ignored error: ${sanitizeDebugError(error)}`);

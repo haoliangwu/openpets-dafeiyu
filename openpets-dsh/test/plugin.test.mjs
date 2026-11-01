@@ -60,6 +60,18 @@ async function emitPaced(ctx, event, ...args) {
   await emitAfter(ctx, 30, event, ...args);
 }
 
+/** Wait for all queued decisions to reach the fake pet. */
+async function drainSends(fake) {
+  const before = fake.reactions().length;
+  for (let i = 0; i < 50; i += 1) {
+    await delay(20);
+    if (fake.reactions().length > before) {
+      await delay(60);
+      return;
+    }
+  }
+}
+
 test('sends paced decisions in order without collapsing them', async (t) => {
   const { fake, ctx } = await loadPlugin(t, { responseDelayMs: 40 });
 
@@ -255,4 +267,47 @@ test('waterfall handlers forward next() and its result untouched', async (t) => 
 
   // The identical `waiting` decision from the questions waterfall is damped.
   assert.deepEqual(fake.reactions(), ['editing', 'waiting']);
+});
+
+test('waiting locks the pet until the user answers', async (t) => {
+  const { fake, ctx } = await loadPlugin(t);
+
+  // The agent is running, then asks for approval.
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'running' });
+  assert.equal(ctx.emit('approval/request', { agent: { id: 'agent-a' } }, () => 'NEXT'), 'NEXT');
+  await drainSends(fake);
+  assert.deepEqual(fake.reactions(), ['thinking', 'waiting']);
+
+  // Busy events while blocked must NOT overwrite the waiting state. The
+  // assistant-stream start doubles as an unlock signal, so it is excluded
+  // here (a real blocked agent emits no stream); tools/result and
+  // tools/pre-execute are the busy noise that must be damped.
+  await emitPaced(ctx, 'tools/result', tool('edit'), { isError: false });
+  await emitPaced(ctx, 'tools/pre-execute', tool('edit'), () => {});
+  await delay(50);
+  assert.deepEqual(fake.reactions(), ['thinking', 'waiting']);
+
+  // The reply arrives: the lock lifts and normal updates resume.
+  await emitPaced(ctx, 'approval/responded', { agent: { id: 'agent-a' } });
+  await drainSends(fake);
+  assert.deepEqual(fake.reactions(), ['thinking', 'waiting', 'thinking']);
+});
+
+test('waiting locks across an agent going idle while blocked', async (t) => {
+  const { fake, ctx } = await loadPlugin(t);
+
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'running' });
+  assert.equal(ctx.emit('user-questions/request', { agent: { id: 'agent-a' } }, () => 'NEXT'), 'NEXT');
+  await drainSends(fake);
+  assert.deepEqual(fake.reactions(), ['thinking', 'waiting']);
+
+  // A stale idle from the waiting agent must not flash success over waiting.
+  await emitPaced(ctx, 'agent/status', { agent: { id: 'agent-a' }, status: 'idle' });
+  await delay(50);
+  assert.deepEqual(fake.reactions(), ['thinking', 'waiting']);
+
+  // A new model stream proves the wait ended: unlock, back to thinking.
+  await emitPaced(ctx, 'agent/assistant-stream', { agent: { id: 'agent-a' }, frame: { type: 'start' } });
+  await drainSends(fake);
+  assert.deepEqual(fake.reactions(), ['thinking', 'waiting', 'thinking']);
 });

@@ -33,7 +33,8 @@ port in `../opencode-v2/`) to the Cordis plugin API that DSH hosts run.
 | `tools/pre-execute` — any other tool | working | — |
 | `tools/result` success | thinking (agent resumes generating) | — |
 | `tools/result` with `isError` | error | — |
-| `approval/request`, `user-questions/request` | waiting | "Approval needed" |
+| `approval/request`, `user-questions/request` | waiting — **locks the pet** until answered | "Approval needed" |
+| `approval/responded`, `user-questions/responded`, `agent/inbox/claimed`, new `assistant-stream` start | unlock, resume normal updates | — |
 | `subagent/start` (a delegated child run) | working (the child drives until it settles) | — |
 | `subagent/end` | hands the pet back to whatever is still busy | — |
 | `agent/disposed` (session left the registry) | releases the pet | — |
